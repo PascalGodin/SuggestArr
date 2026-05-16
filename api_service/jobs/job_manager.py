@@ -190,12 +190,7 @@ class JobManager:
             return
 
         self.logger.info(f"Job {job_id} ({job_data['name']}) waiting for available slot...")
-        acquired = self._job_semaphore.acquire(timeout=3600)
-        if not acquired:
-            self.logger.warning(
-                f"Job {job_id} ({job_data['name']}) timed out after 1 hour waiting in queue. Skipping."
-            )
-            return
+        self._job_semaphore.acquire()
 
         self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
         try:
@@ -203,7 +198,13 @@ class JobManager:
             asyncio.set_event_loop(loop)
 
             try:
-                loop.run_until_complete(executor(job_id))
+                loop.run_until_complete(
+                    asyncio.wait_for(executor(job_id), timeout=3600)
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Job {job_id} ({job_data['name']}) timed out after 1 hour of execution. Skipping."
+                )
             finally:
                 close_event_loop(loop, self.logger)
 
