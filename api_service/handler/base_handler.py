@@ -158,8 +158,6 @@ class BaseMediaHandler(ABC):
         
         return {"id": 0, "name": "LLM Recommendation"}
     
-    # Maximum history items to resolve for similar-item fetching.
-    _MAX_CANDIDATE_SOURCES = 5
     # Maximum candidates shown to the LLM as a selection pool.
     _MAX_CANDIDATES = 50
 
@@ -233,8 +231,6 @@ class BaseMediaHandler(ABC):
             if excluded_ids:
                 discover_filters['without_genres'] = ','.join(excluded_ids)
 
-        top_sources = history_items[:self._MAX_CANDIDATE_SOURCES]
-
         async def _fetch_popular():
             async with TMDbDiscover(tc.api_key) as tmdb_discover:
                 if item_type == 'movie':
@@ -242,7 +238,7 @@ class BaseMediaHandler(ABC):
                 return await tmdb_discover.discover_tv(discover_filters, max_results=40)
 
         similar_lists, popular = await asyncio.gather(
-            asyncio.gather(*[_get_similar(item) for item in top_sources]),
+            asyncio.gather(*[_get_similar(item) for item in history_items]),
             _fetch_popular(),
         )
 
