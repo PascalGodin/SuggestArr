@@ -366,10 +366,15 @@ class BaseMediaHandler(ABC):
                 item['_candidate_source'] = 'popular'
                 candidates.append(item)
 
-        # Remove items the user has already watched.
+        # Remove items already in the library or already discovered by Seerr.
+        # These are O(1) set lookups using data loaded at handler init — no extra API calls.
+        # Per-item checks (already_requested, watch_providers) happen downstream as usual.
+        library_ids = self.existing_content_sets.get(item_type, set())
         filtered = [
             c for c in candidates
             if _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
+            and str(c.get('id', '')) not in library_ids
+            and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)
         ]
 
         self.logger.info(
