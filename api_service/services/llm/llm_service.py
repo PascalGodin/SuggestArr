@@ -822,7 +822,7 @@ async def get_recommendations_from_history(
                 "score": rec.score,
             }
             score_str = f"{rec.score}%" if rec.score is not None else "n/a"
-            logger.debug(
+            logger.info(
                 "[%s (%s)] score=%s — %s", rec.title, rec.year, score_str, rec_dict["rationale"]
             )
             valid_recommendations.append(rec_dict)
