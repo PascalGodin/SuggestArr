@@ -246,7 +246,8 @@ class BaseMediaHandler(ABC):
             _fetch_popular(),
         )
 
-        # Deduplicate by TMDb ID; similar items first (more personalised), popular fills gaps.
+        # Deduplicate by TMDb ID; tag each item with its origin so the LLM prompt
+        # can present them in separate labeled sections.
         seen_ids: set = set()
         candidates: list = []
         for items in similar_lists:
@@ -254,11 +255,13 @@ class BaseMediaHandler(ABC):
                 item_id = item.get('id')
                 if item_id and item_id not in seen_ids:
                     seen_ids.add(item_id)
+                    item['_candidate_source'] = 'recommended'
                     candidates.append(item)
         for item in popular:
             item_id = item.get('id')
             if item_id and item_id not in seen_ids:
                 seen_ids.add(item_id)
+                item['_candidate_source'] = 'popular'
                 candidates.append(item)
 
         # Remove items the user has already watched.
