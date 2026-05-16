@@ -5,6 +5,7 @@ import asyncio
 import re
 from abc import ABC, abstractmethod
 from api_service.services.llm.llm_service import is_llm_configured, get_recommendations_from_history
+from api_service.services.tmdb.tmdb_discover import TMDbDiscover
 from api_service.config.config import load_env_vars
 
 
@@ -157,10 +158,128 @@ class BaseMediaHandler(ABC):
         
         return {"id": 0, "name": "LLM Recommendation"}
     
+    # Maximum history items to resolve for similar-item fetching.
+    _MAX_CANDIDATE_SOURCES = 5
+    # Maximum candidates shown to the LLM as a selection pool.
+    _MAX_CANDIDATES = 50
+
+    async def _build_candidate_pool(self, history_items: list, item_type: str) -> list:
+        """Build a pool of pre-validated TMDb candidates for LLM selection.
+
+        Resolves the top watched items to TMDb IDs, fetches similar items for
+        each (reusing the same pipeline as the non-LLM path), and appends
+        trending items from TMDb. Returns a deduplicated, filter-passing list
+        capped at _MAX_CANDIDATES.
+
+        Args:
+            history_items: List of watched items with 'title' and 'year'.
+            item_type: 'movie' or 'tv'.
+
+        Returns:
+            List of formatted TMDb result dicts ready for LLM selection.
+        """
+        search_fn = self.tmdb_client.search_movie if item_type == 'movie' else self.tmdb_client.search_tv
+        similar_fn = self.tmdb_client.find_similar_movies if item_type == 'movie' else self.tmdb_client.find_similar_tvshows
+
+        # Normalise history titles for membership checks (avoid recommending already-watched items).
+        def _norm(title: str) -> str:
+            title = re.sub(r'\s*[-–]\s*S\d+E\d+.*', '', title, flags=re.IGNORECASE)
+            title = re.sub(r'\s*\((19|20)\d{2}\)\s*$', '', title)
+            return title.strip().lower()
+
+        history_titles_norm = {
+            _norm(h.get('title') or h.get('name') or '')
+            for h in history_items
+            if h.get('title') or h.get('name')
+        }
+
+        async def _get_similar(item):
+            title = item.get('title') or item.get('name') or ''
+            year = item.get('year')
+            if not title:
+                return []
+            try:
+                results = await search_fn(title, year)
+                if not results:
+                    return []
+                tmdb_id = results[0].get('id')
+                if not tmdb_id:
+                    return []
+                return await similar_fn(tmdb_id)
+            except Exception as exc:
+                self.logger.warning("Candidate pool: error fetching similar for '%s': %s", title, exc)
+                return []
+
+        # Build discover filters for popular items — mirrors the job's quality settings.
+        discover_filters: dict = {'sort_by': 'popularity.desc'}
+        tc = self.tmdb_client
+        if tc.tmdb_threshold and tc.rating_source != 'imdb':
+            discover_filters['vote_average_gte'] = tc.tmdb_threshold / 10
+        if tc.tmdb_min_votes and tc.rating_source != 'imdb':
+            discover_filters['vote_count_gte'] = tc.tmdb_min_votes
+        if tc.language_filter:
+            discover_filters['with_original_language'] = tc.language_filter
+        if tc.release_year_filter:
+            key = 'primary_release_date_gte' if item_type == 'movie' else 'first_air_date_gte'
+            discover_filters[key] = tc.release_year_filter
+        if tc.release_year_filter_to:
+            key = 'primary_release_date_lte' if item_type == 'movie' else 'first_air_date_lte'
+            discover_filters[key] = tc.release_year_filter_to
+        if tc.genre_filter:
+            excluded_ids = [
+                str(g.get('id')) for g in tc.genre_filter
+                if isinstance(g, dict) and g.get('id')
+            ]
+            if excluded_ids:
+                discover_filters['without_genres'] = ','.join(excluded_ids)
+
+        top_sources = history_items[:self._MAX_CANDIDATE_SOURCES]
+
+        async def _fetch_popular():
+            async with TMDbDiscover(tc.api_key) as tmdb_discover:
+                if item_type == 'movie':
+                    return await tmdb_discover.discover_movies(discover_filters, max_results=40)
+                return await tmdb_discover.discover_tv(discover_filters, max_results=40)
+
+        similar_lists, popular = await asyncio.gather(
+            asyncio.gather(*[_get_similar(item) for item in top_sources]),
+            _fetch_popular(),
+        )
+
+        # Deduplicate by TMDb ID; similar items first (more personalised), popular fills gaps.
+        seen_ids: set = set()
+        candidates: list = []
+        for items in similar_lists:
+            for item in items:
+                item_id = item.get('id')
+                if item_id and item_id not in seen_ids:
+                    seen_ids.add(item_id)
+                    candidates.append(item)
+        for item in popular:
+            item_id = item.get('id')
+            if item_id and item_id not in seen_ids:
+                seen_ids.add(item_id)
+                candidates.append(item)
+
+        # Remove items the user has already watched.
+        filtered = [
+            c for c in candidates
+            if _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
+        ]
+
+        self.logger.info(
+            "Candidate pool: %d items (%d from similar + %d from popular, before cap)",
+            len(filtered),
+            sum(len(lst) for lst in similar_lists),
+            len(popular),
+        )
+        return filtered[:self._MAX_CANDIDATES]
+
     async def process_llm_recommendations(self, user_or_history_items, history_items_or_item_type, item_type_or_max_results, max_results=None):
         """
-        Pass history to LLM, resolve TMDb IDs in parallel, and request them.
-        
+        Build a candidate pool from non-AI TMDb results, pass to LLM for selection,
+        resolve TMDb IDs, and submit to Seer.
+
         Args:
             user_or_history_items: User object (new call form) or history items (legacy call form)
             history_items_or_item_type: History items (new call form) or item_type (legacy call form)
@@ -183,9 +302,19 @@ class BaseMediaHandler(ABC):
 
         if max_results <= 0:
             return
-        
+
         self.logger.info(f"Delegating {max_results} {item_type} recommendations to LLM service.")
-        
+
+        # Build a pre-validated candidate pool so the LLM selects real items rather
+        # than generating titles that may not exist on TMDb.
+        candidates: list = []
+        try:
+            candidates = await self._build_candidate_pool(history_items, item_type)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to build candidate pool — falling back to LLM generation mode: %s", exc
+            )
+
         llm_recommendations = await get_recommendations_from_history(
             history_items,
             max_results,
@@ -196,49 +325,66 @@ class BaseMediaHandler(ABC):
                 "release_year_lte": self.tmdb_client.release_year_filter_to,
                 "vote_average_gte": self.tmdb_client.tmdb_threshold / 10 if self.tmdb_client.tmdb_threshold else None,
             },
+            candidates=candidates if candidates else None,
         )
-        
+
         if not llm_recommendations:
             self.logger.warning("LLM returned no recommendations.")
             return
-        
+
+        # Build a lookup by normalised title so matched candidates can be used
+        # directly without a second TMDb search.
+        candidate_lookup: dict = {}
+        for c in candidates:
+            title_norm = (c.get('title') or c.get('name') or '').strip().lower()
+            if title_norm and title_norm not in candidate_lookup:
+                candidate_lookup[title_norm] = c
+
         search_fn = self.tmdb_client.search_movie if item_type == 'movie' else self.tmdb_client.search_tv
-        
+        _sentinel = {"id": 0, "name": "LLM Recommendation"}
+
         async def resolve(rec):
-            """Fetch TMDB data for the recommended item and its source in parallel."""
+            """Return (rec, [tmdb_dict], source_obj), using candidate lookup when possible."""
+            title_norm = (rec.get("title") or "").strip().lower()
+            matched = candidate_lookup.get(title_norm)
+            if matched:
+                # Candidate already validated by _fetch_recommendations — skip search.
+                return rec, [matched], _sentinel
+
+            # LLM went off-script or we are in generation mode — fall back to search.
             rec_results, source_obj = await asyncio.gather(
                 search_fn(rec.get("title"), rec.get("year")),
                 self._resolve_llm_source(rec.get("source_title"), item_type),
             )
             return rec, rec_results, source_obj
-        
+
         resolved = await asyncio.gather(*[resolve(rec) for rec in llm_recommendations])
-        
+
         request_tasks = []
         for rec, rec_results, source_obj in resolved:
             if not rec_results:
                 continue
-            
+
             best_match = rec_results[0]
             filter_result = self.tmdb_client._apply_filters(best_match, item_type)
             best_match['filter_results'] = filter_result
-            
+
             if not filter_result.get('passed', False):
                 self.logger.info(
                     "Skipping LLM %s recommendation '%s': failed configured filters (%s)",
                     item_type,
                     best_match.get('title') or best_match.get('name') or 'Unknown',
-                    ', '.join(k for k, v in filter_result.items() 
-                             if k != 'passed' and isinstance(v, dict) and v.get('passed') is False)
+                    ', '.join(k for k, v in filter_result.items()
+                              if k != 'passed' and isinstance(v, dict) and v.get('passed') is False)
                 )
                 continue
-            
+
             best_match['rationale'] = rec.get('rationale')
             if user is None:
                 request_tasks.append(self._request_llm_recommendation(best_match, item_type, source_obj))
             else:
                 request_tasks.append(self._request_llm_recommendation(best_match, item_type, source_obj, user))
-        
+
         if request_tasks:
             self.logger.info(f"LLM matched {len(request_tasks)} {item_type} items to TMDb.")
             await asyncio.gather(*request_tasks)

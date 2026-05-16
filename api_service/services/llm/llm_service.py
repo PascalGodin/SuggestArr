@@ -345,16 +345,23 @@ async def get_recommendations_from_history(
     max_results: int = 5,
     item_type: str = "movie",
     filters: Optional[Dict[str, Any]] = None,
+    candidates: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """Generate recommendations based on a user's watch history using an LLM.
+
+    When *candidates* is provided the LLM selects from that pre-validated pool
+    instead of generating titles freely, which eliminates hallucination.
 
     :param history_items: List of dicts with 'title' and ideally 'year'.
     :param max_results: Number of recommendations to generate.
     :param item_type: 'movie' or 'tv'.
     :param filters: Optional recommendation constraints (e.g. language/year/rating).
+    :param candidates: Optional list of pre-validated TMDb result dicts (same
+        format as returned by TMDbClient._format_result). When non-empty the LLM
+        is instructed to select from this pool rather than invent titles.
     :raises LLMValidationError: When the LLM persistently returns invalid JSON.
     :return: List of recommendation dicts with 'title', 'year', 'rationale',
-        and 'source_title'.
+        and 'source_title' (None when using candidate-selection mode).
     """
     client = get_llm_client()
     if not client:
@@ -448,7 +455,57 @@ async def get_recommendations_from_history(
         if constraint_lines:
             constraints_block = "\nApply these hard constraints:\n" + "\n".join(constraint_lines) + "\n"
 
-        prompt = f"""
+        if candidates:
+            # Candidate-selection mode: LLM picks from a pre-validated pool.
+            # This eliminates hallucination — all candidates are real TMDb items.
+            date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
+            candidate_lines: List[str] = []
+            for i, c in enumerate(candidates, 1):
+                title = c.get('title') or c.get('name') or 'Unknown'
+                raw_date = c.get(date_field) or c.get('release_date') or c.get('first_air_date') or ''
+                year = raw_date[:4] if raw_date else '?'
+                overview = (c.get('overview') or '').strip()
+                if len(overview) > 120:
+                    overview = overview[:117] + '...'
+                line = f"{i}. {title} ({year})"
+                if overview:
+                    line += f" — {overview}"
+                candidate_lines.append(line)
+            candidate_text = "\n".join(candidate_lines)
+
+            prompt = f"""
+        You are an expert film and television recommendation system.
+        The user has recently watched and enjoyed the following {list_type}:
+
+        {history_text}
+        {constraints_block}
+        Analyze the themes, genres, pacing, and tone of their watch history to build a taste profile.
+        Then select exactly {max_results} {list_type} from the CANDIDATE LIST below that they are most likely to enjoy next.
+
+        CANDIDATE LIST (you MUST only pick from this list):
+        {candidate_text}
+
+        Follow these strict rules:
+        1. ONLY select items from the CANDIDATE LIST above. Do NOT invent or suggest any title not in the list.
+        2. Do NOT select any {list_type} the user has already watched (listed above).
+        3. Choose the items whose themes, genre, and tone best match the user's taste profile.
+        4. ONLY respond with a valid JSON object with a single key "recommendations" containing an array of objects.
+        5. Each object MUST have: a "title" string (exact title from the candidate list), a "year" integer (exact year from the candidate list), and a "rationale" string explaining why it fits the user's taste.
+        6. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
+        7. The "title" field must be a plain JSON string without extra qualifiers outside the string.
+
+        Example format:
+        {{
+          "recommendations": [
+            {{"title": "Example Movie", "year": 2023, "rationale": "Shares the same dark atmosphere as..."}},
+            {{"title": "Another Film", "year": 1999, "rationale": "Similar themes of redemption to..."}}
+          ]
+        }}
+    """
+        else:
+            # Generation mode (fallback): LLM freely suggests titles.
+            # Used when no candidate pool could be built.
+            prompt = f"""
         You are an expert film and television recommendation system.
         The user has recently watched and enjoyed the following {list_type}:
 
@@ -483,10 +540,12 @@ async def get_recommendations_from_history(
         ]
 
         logger.debug(
-            "Sending LLM request (%s) for %d unique %s history items.",
+            "Sending LLM request (%s) for %d unique %s history items (%s mode, %d candidates).",
             model,
             len(history_items),
             list_type,
+            "selection" if candidates else "generation",
+            len(candidates) if candidates else 0,
         )
 
         try:

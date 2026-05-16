@@ -353,7 +353,7 @@ def build_job_data(name):
 
 
 def make_llm_side_effect():
-    async def _side_effect(history_items, max_results, item_type, filters=None):
+    async def _side_effect(history_items, max_results, item_type, filters=None, candidates=None):
         assert isinstance(history_items, list)
         assert max_results > 0
         assert item_type in {"movie", "tv"}
