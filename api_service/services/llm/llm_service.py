@@ -688,14 +688,36 @@ async def get_recommendations_from_history(
             # This eliminates hallucination — all candidates are real TMDb items.
             date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
 
+            # Static TMDb genre ID → name lookup (covers movies and TV shows).
+            _GENRE_NAMES: Dict[int, str] = {
+                28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
+                80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+                14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+                9648: "Mystery", 10749: "Romance", 878: "Science Fiction",
+                10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
+                # TV-specific
+                10759: "Action & Adventure", 10762: "Kids", 10763: "News",
+                10764: "Reality", 10765: "Sci-Fi & Fantasy", 10766: "Soap",
+                10767: "Talk", 10768: "War & Politics",
+            }
+
             def _fmt(c: Dict, i: int) -> str:
                 title = c.get('title') or c.get('name') or 'Unknown'
                 raw_date = c.get(date_field) or c.get('release_date') or c.get('first_air_date') or ''
                 year = raw_date[:4] if raw_date else '?'
                 overview = (c.get('overview') or '').strip()
-                if len(overview) > 120:
-                    overview = overview[:117] + '...'
-                line = f"{i}. {title} ({year})"
+                if len(overview) > 150:
+                    overview = overview[:147] + '...'
+                rating = c.get('rating') or c.get('vote_average')
+                genre_ids = c.get('genre_ids') or []
+                genre_names = [_GENRE_NAMES[gid] for gid in genre_ids if gid in _GENRE_NAMES][:3]
+                meta_parts: List[str] = []
+                if rating:
+                    meta_parts.append(f"rating: {float(rating):.1f}/10")
+                if genre_names:
+                    meta_parts.append(', '.join(genre_names))
+                meta = f" [{'; '.join(meta_parts)}]" if meta_parts else ''
+                line = f"{i}. {title} ({year}){meta}"
                 return line + f" — {overview}" if overview else line
 
             recommended = [c for c in candidates if c.get('_candidate_source') == 'recommended']
