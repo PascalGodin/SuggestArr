@@ -46,6 +46,9 @@ class JobManager:
         self.repository = JobRepository()
         # Executors for different job types
         self._job_executors: Dict[str, Callable] = {}
+        # Semaphore ensures jobs run one at a time (critical for local LLM providers
+        # that cannot handle concurrent inference requests).
+        self._job_semaphore = threading.Semaphore(1)
         self._initialized = True
         self.logger.info("JobManager initialized")
 
@@ -179,26 +182,35 @@ class JobManager:
         Creates a new event loop for async execution.
         Determines job type and calls appropriate executor.
 
+        Jobs are queued via a semaphore so only one runs at a time, preventing
+        concurrent LLM inference requests on local providers.
+
         Args:
             job_id: Database ID of the job.
         """
-        # Get job data to determine type
+        # Validate before queuing so we fail fast without holding the slot.
         job_data = self.repository.get_job(job_id)
         if not job_data:
             self.logger.error(f"Job not found: {job_id}")
             return
 
         job_type = job_data.get('job_type', 'discover')
-        self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
 
-        # Get the executor for this job type
         executor = self._job_executors.get(job_type)
         if executor is None:
             self.logger.error(f"No executor set for job type: {job_type}")
             return
 
+        self.logger.info(f"Job {job_id} ({job_data['name']}) waiting for available slot...")
+        acquired = self._job_semaphore.acquire(timeout=3600)
+        if not acquired:
+            self.logger.warning(
+                f"Job {job_id} ({job_data['name']}) timed out after 1 hour waiting in queue. Skipping."
+            )
+            return
+
+        self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
         try:
-            # Create new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
@@ -249,6 +261,8 @@ class JobManager:
             self.logger.error(f"Job {job_id} execution failed: {str(e)}")
             if execution_id is not None:
                 self.repository.log_execution_end(execution_id, 'failed', error_message='Job execution failed')
+        finally:
+            self._job_semaphore.release()
 
     async def _should_pause_for_pending_requests(self, job_data: Dict[str, Any]) -> bool:
         """Return True when this job should skip because Seer has pending requests."""
