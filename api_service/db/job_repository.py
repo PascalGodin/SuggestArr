@@ -653,6 +653,39 @@ class JobRepository:
             self.logger.info(f"Created system job ID: {job_id}")
             return job_id
 
+    def duplicate_job(self, job_id: int, owner_id: Optional[int] = None) -> Optional[int]:
+        """
+        Duplicate an existing job, giving the copy a new name and owner.
+
+        Args:
+            job_id: ID of the job to duplicate.
+            owner_id: User ID to assign as the owner of the copy.
+
+        Returns:
+            ID of the newly created job, or None if the source job was not found.
+        """
+        source = self.get_job(job_id)
+        if not source:
+            self.logger.warning(f"Cannot duplicate job {job_id}: not found")
+            return None
+
+        new_data = {
+            'name': f"{source['name']} (Copy)",
+            'job_type': source['job_type'],
+            'media_type': source['media_type'],
+            'filters': source['filters'],
+            'schedule_type': source['schedule_type'],
+            'schedule_value': source['schedule_value'],
+            'max_results': source['max_results'],
+            'user_ids': source['user_ids'],
+            'enabled': False,
+            'is_system': False,
+            'owner_id': owner_id,
+        }
+        new_id = self.create_job(new_data)
+        self.logger.info(f"Duplicated job {job_id} as new job {new_id}")
+        return new_id
+
     def delete_job(self, job_id: int, allow_system: bool = False) -> bool:
         """
         Delete a discover job and its execution history.
