@@ -687,8 +687,8 @@ async def get_recommendations_from_history(
             # Candidate-selection mode: LLM picks from a pre-validated pool.
             # This eliminates hallucination — all candidates are real TMDb items.
             date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
-            candidate_lines: List[str] = []
-            for i, c in enumerate(candidates, 1):
+
+            def _fmt(c: Dict, i: int) -> str:
                 title = c.get('title') or c.get('name') or 'Unknown'
                 raw_date = c.get(date_field) or c.get('release_date') or c.get('first_air_date') or ''
                 year = raw_date[:4] if raw_date else '?'
@@ -696,10 +696,32 @@ async def get_recommendations_from_history(
                 if len(overview) > 120:
                     overview = overview[:117] + '...'
                 line = f"{i}. {title} ({year})"
-                if overview:
-                    line += f" — {overview}"
-                candidate_lines.append(line)
-            candidate_text = "\n".join(candidate_lines)
+                return line + f" — {overview}" if overview else line
+
+            recommended = [c for c in candidates if c.get('_candidate_source') == 'recommended']
+            popular = [c for c in candidates if c.get('_candidate_source') == 'popular']
+
+            sections: List[str] = []
+            counter = 1
+            if recommended:
+                lines = []
+                for c in recommended:
+                    lines.append(_fmt(c, counter))
+                    counter += 1
+                sections.append(
+                    "RECOMMENDED FOR YOU (based on your watch history — highest priority):\n"
+                    + "\n".join(lines)
+                )
+            if popular:
+                lines = []
+                for c in popular:
+                    lines.append(_fmt(c, counter))
+                    counter += 1
+                sections.append(
+                    "CURRENTLY POPULAR (use to fill remaining slots if recommended list is exhausted):\n"
+                    + "\n".join(lines)
+                )
+            candidate_text = "\n\n".join(sections)
 
             prompt = f"""
         You are an expert film and television recommendation system.
@@ -708,19 +730,19 @@ async def get_recommendations_from_history(
         {history_text}
         {constraints_block}
         Analyze the themes, genres, pacing, and tone of their watch history to build a taste profile.
-        Then select exactly {max_results} {list_type} from the CANDIDATE LIST below that they are most likely to enjoy next.
+        Then select exactly {max_results} {list_type} from the CANDIDATE LISTS below that they are most likely to enjoy next.
 
-        CANDIDATE LIST (you MUST only pick from this list):
         {candidate_text}
 
         Follow these strict rules:
-        1. ONLY select items from the CANDIDATE LIST above. Do NOT invent or suggest any title not in the list.
+        1. ONLY select items from the candidate lists above. Do NOT invent or suggest any title not in the lists.
         2. Do NOT select any {list_type} the user has already watched (listed above).
-        3. Choose the items whose themes, genre, and tone best match the user's taste profile.
-        4. ONLY respond with a valid JSON object with a single key "recommendations" containing an array of objects.
-        5. Each object MUST have: a "title" string (exact title from the candidate list), a "year" integer (exact year from the candidate list), and a "rationale" string explaining why it fits the user's taste.
-        6. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
-        7. The "title" field must be a plain JSON string without extra qualifiers outside the string.
+        3. Prioritise items from the RECOMMENDED FOR YOU list — they are personalised to the user's history.
+        4. Only draw from CURRENTLY POPULAR when you need to fill remaining slots.
+        5. ONLY respond with a valid JSON object with a single key "recommendations" containing an array of objects.
+        6. Each object MUST have: a "title" string (exact title from the lists), a "year" integer (exact year from the lists), and a "rationale" string explaining why it fits the user's taste.
+        7. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
+        8. The "title" field must be a plain JSON string without extra qualifiers outside the string.
 
         Example format:
         {{
