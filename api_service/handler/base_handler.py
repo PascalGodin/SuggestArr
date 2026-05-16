@@ -460,8 +460,9 @@ class BaseMediaHandler(ABC):
             title_norm = (rec.get("title") or "").strip().lower()
             matched = candidate_lookup.get(title_norm)
             if matched:
-                # Candidate already validated by _fetch_recommendations — skip search.
-                return rec, [matched], _sentinel
+                # Candidate already validated — skip TMDb search but still resolve source.
+                source_obj = await self._resolve_llm_source(rec.get("source_title"), item_type)
+                return rec, [matched], source_obj
 
             # LLM went off-script or we are in generation mode — fall back to search.
             rec_results, source_obj = await asyncio.gather(
