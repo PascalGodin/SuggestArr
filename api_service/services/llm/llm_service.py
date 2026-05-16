@@ -25,6 +25,7 @@ from api_service.config.logger_manager import LoggerManager
 from api_service.exceptions.api_exceptions import LLMValidationError
 from api_service.services.config_service import ConfigService
 from api_service.services.llm.schemas import (
+    CandidateScoringResponse,
     DiscoverParams,
     RecommendationList,
     SearchResultRationaleList,
@@ -625,8 +626,9 @@ async def get_recommendations_from_history(
             constraints_block = "\nApply these hard constraints:\n" + "\n".join(constraint_lines) + "\n"
 
         if candidates:
-            # Candidate-selection mode: LLM picks from a pre-validated pool.
-            # This eliminates hallucination — all candidates are real TMDb items.
+            # Scoring mode: LLM rates every candidate for taste fit; we select the top N.
+            # This eliminates hallucination (all candidates are real TMDb items) and lets
+            # the code — not the LLM — decide the final cut-off.
             date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
 
             # Static TMDb genre ID → name lookup (covers movies and TV shows).
@@ -636,7 +638,6 @@ async def get_recommendations_from_history(
                 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
                 9648: "Mystery", 10749: "Romance", 878: "Science Fiction",
                 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
-                # TV-specific
                 10759: "Action & Adventure", 10762: "Kids", 10763: "News",
                 10764: "Reality", 10765: "Sci-Fi & Fantasy", 10766: "Soap",
                 10767: "Talk", 10768: "War & Politics",
@@ -666,24 +667,23 @@ async def get_recommendations_from_history(
 
             sections: List[str] = []
             counter = 1
-            if recommended:
-                lines = []
-                for c in recommended:
-                    lines.append(_fmt(c, counter))
-                    counter += 1
-                sections.append(
-                    "RECOMMENDED FOR YOU (based on your watch history — highest priority, sorted by rating descending):\n"
-                    + "\n".join(lines)
-                )
-            if popular:
-                lines = []
-                for c in popular:
-                    lines.append(_fmt(c, counter))
-                    counter += 1
-                sections.append(
-                    "CURRENTLY POPULAR (use to fill remaining slots if recommended list is exhausted, sorted by rating descending):\n"
-                    + "\n".join(lines)
-                )
+            index_to_candidate: Dict[int, Dict] = {}
+            for c in recommended:
+                index_to_candidate[counter] = c
+                sections_line = _fmt(c, counter)
+                counter += 1
+                if len(sections) == 0:
+                    sections.append("RECOMMENDED FOR YOU (personalised, sorted by rating):\n" + sections_line)
+                else:
+                    sections[0] += "\n" + sections_line
+            for c in popular:
+                index_to_candidate[counter] = c
+                sections_line = _fmt(c, counter)
+                counter += 1
+                if len(sections) < 2:
+                    sections.append("CURRENTLY POPULAR (sorted by rating):\n" + sections_line)
+                else:
+                    sections[1] += "\n" + sections_line
             candidate_text = "\n\n".join(sections)
 
             prompt = f"""
@@ -692,36 +692,93 @@ async def get_recommendations_from_history(
 
         {history_text}
         {constraints_block}
-        Analyze the themes, genres, pacing, and tone of their watch history to build a taste profile.
-        Then select exactly {max_results} {list_type} from the CANDIDATE LISTS below that they are most likely to enjoy next.
+        Analyse the themes, genres, pacing, and tone of their watch history to build a taste profile.
+        Then score EVERY candidate below from 0 to 100 based on how well it matches the user's taste.
+        We will select the top {max_results} highest-scored items automatically.
 
         {candidate_text}
 
-        Follow these strict rules:
-        1. ONLY select items from the candidate lists above. Do NOT invent or suggest any title not in the lists.
-        2. Do NOT select any {list_type} the user has already watched (listed above).
-        3. Prioritise items from the RECOMMENDED FOR YOU list — they are personalised to the user's history.
-        4. Only draw from CURRENTLY POPULAR when you need to fill remaining slots.
-        5. ONLY respond with a valid JSON object with the following keys:
-           - "taste_profile": a single sentence summarising the user's taste based on their watch history.
-           - "recommendations": an array of exactly {max_results} objects.
-        6. Each recommendation object MUST have:
-           - "title": exact title from the lists (plain string, no extra qualifiers outside it)
-           - "year": exact year from the lists (integer)
-           - "source_title": EXACT title from the watch history that most inspired this pick
-           - "rationale": one sentence explaining why it fits the user's taste
-           - "score": integer 0–100 representing how well this item matches the user's taste profile
-        7. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
+        Rules:
+        1. Score EVERY candidate — do not skip any index.
+        2. Score 0–100: 100 = perfect fit, 0 = completely mismatched.
+        3. The "reason" must be one short sentence explaining why this item fits or does not fit the user's taste (not a plot summary).
+        4. Do NOT invent items. Only score items from the lists above.
+        5. ONLY respond with a valid JSON object — no markdown, no extra text.
 
-        Example format:
+        Response format:
         {{
-          "taste_profile": "The user enjoys light-hearted family comedies with relatable characters.",
-          "recommendations": [
-            {{"title": "Example Movie", "year": 2023, "source_title": "Watched Show", "rationale": "Shares the same warm humour as...", "score": 87}},
-            {{"title": "Another Film", "year": 1999, "source_title": "Another Watched Show", "rationale": "Similar family dynamics to...", "score": 74}}
+          "taste_profile": "One sentence summarising the user's taste.",
+          "scores": [
+            {{"index": 1, "score": 87, "reason": "Matches the user's love of dark sci-fi thriller pacing"}},
+            {{"index": 2, "score": 34, "reason": "Too slow and romance-focused for this action-oriented viewer"}},
+            ...
           ]
         }}
     """
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a specialized system that only outputs raw JSON objects for media scoring.",
+                },
+                {"role": "user", "content": prompt},
+            ]
+
+            logger.debug(
+                "Sending LLM scoring request (%s) for %d unique %s history items (%d candidates).",
+                model, len(history_items), list_type, len(candidates),
+            )
+
+            try:
+                scored: CandidateScoringResponse = await _call_with_validation(
+                    client=client,
+                    model=model,
+                    messages=messages,
+                    schema_cls=CandidateScoringResponse,
+                    temperature=0.7,
+                    max_retries=max_retries,
+                )
+            except LLMValidationError as exc:
+                logger.error(
+                    "LLM scoring request failed after retries — falling back to standard algorithm. %s", exc,
+                )
+                return []
+
+            logger.info("LLM taste profile: %s", scored.taste_profile)
+
+            sorted_scores = sorted(scored.scores, key=lambda s: s.score, reverse=True)
+            valid_recommendations: List[Dict] = []
+            for entry in sorted_scores:
+                if len(valid_recommendations) >= max_results:
+                    break
+                candidate = index_to_candidate.get(entry.index)
+                if not candidate:
+                    logger.warning("LLM returned unknown index %d — skipping.", entry.index)
+                    continue
+                title = candidate.get('title') or candidate.get('name') or ''
+                if not title:
+                    continue
+                raw_date = candidate.get(date_field) or candidate.get('release_date') or candidate.get('first_air_date') or ''
+                year_str = raw_date[:4] if raw_date else ''
+                try:
+                    year = int(year_str)
+                except ValueError:
+                    year = 0
+                if _is_duplicate_of_history(title.strip().lower(), history_titles_lower):
+                    logger.debug("Filtered duplicate (scored): %s", title)
+                    continue
+                logger.info("[%s (%s)] score=%d%% — %s", title, year or '?', entry.score, entry.reason)
+                valid_recommendations.append({
+                    "title": title,
+                    "year": year,
+                    "rationale": entry.reason,
+                    "source_title": None,
+                    "score": entry.score,
+                })
+
+            logger.info("Selected %d top-scored %s recommendations.", len(valid_recommendations), list_type)
+            return valid_recommendations
+
         else:
             # Generation mode (fallback): LLM freely suggests titles.
             # Used when no candidate pool could be built.
@@ -754,81 +811,67 @@ async def get_recommendations_from_history(
         }}
     """
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a specialized system that only outputs raw JSON objects for media recommendations.",
-            },
-            {"role": "user", "content": prompt},
-        ]
+            gen_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a specialized system that only outputs raw JSON objects for media recommendations.",
+                },
+                {"role": "user", "content": prompt},
+            ]
 
-        logger.debug(
-            "Sending LLM request (%s) for %d unique %s history items (%s mode, %d candidates).",
-            model,
-            len(history_items),
-            list_type,
-            "selection" if candidates else "generation",
-            len(candidates) if candidates else 0,
-        )
-
-        try:
-            validated: RecommendationList = await _call_with_validation(
-                client=client,
-                model=model,
-                messages=messages,
-                schema_cls=RecommendationList,
-                **generation_settings,
-                max_retries=max_retries,
+            logger.debug(
+                "Sending LLM generation request (%s) for %d unique %s history items.",
+                model, len(history_items), list_type,
             )
-        except LLMValidationError as exc:
-            logger.error(
-                "LLM recommendation request failed after retries — falling back to standard algorithm. %s",
-                exc,
-            )
-            return []
 
-        if validated.taste_profile:
-            logger.info("LLM taste profile: %s", validated.taste_profile)
-
-        valid_recommendations: List[Dict] = []
-        for rec in validated.recommendations:
-            rec_title = rec.title.strip().lower()
-
-            if _is_duplicate_of_history(rec_title, history_titles_lower):
-                logger.debug(
-                    "Filtered duplicate recommendation already in watch history: %s", rec.title
+            try:
+                validated: RecommendationList = await _call_with_validation(
+                    client=client,
+                    model=model,
+                    messages=gen_messages,
+                    schema_cls=RecommendationList,
+                    temperature=0.7,
+                    max_retries=max_retries,
                 )
-                continue
+            except LLMValidationError as exc:
+                logger.error(
+                    "LLM recommendation request failed after retries — falling back to standard algorithm. %s",
+                    exc,
+                )
+                return []
 
-            source_title = rec.source_title
-            if source_title:
-                clean_source = _normalize_title(source_title)
-                if clean_source not in history_titles_lower:
-                    logger.warning(
-                        "LLM returned source_title '%s' not found in history. Clearing.",
-                        source_title,
-                    )
-                    source_title = None
-                else:
-                    stripped = re.sub(r'\s*[-–]\s*S\d+E\d+.*', '', source_title, flags=re.IGNORECASE)
-                    stripped = re.sub(r'\s*\((19|20)\d{2}\)\s*$', '', stripped)
-                    source_title = stripped.strip()
+            valid_recommendations: List[Dict] = []
+            for rec in validated.recommendations:
+                rec_title = rec.title.strip().lower()
 
-            rec_dict: Dict[str, Any] = {
-                "title": rec.title,
-                "year": rec.year,
-                "rationale": rec.rationale or "No rationale provided by LLM.",
-                "source_title": source_title,
-                "score": rec.score,
-            }
-            score_str = f"{rec.score}%" if rec.score is not None else "n/a"
-            logger.info(
-                "[%s (%s)] score=%s — %s", rec.title, rec.year, score_str, rec_dict["rationale"]
-            )
-            valid_recommendations.append(rec_dict)
+                if _is_duplicate_of_history(rec_title, history_titles_lower):
+                    logger.debug("Filtered duplicate recommendation already in watch history: %s", rec.title)
+                    continue
 
-        logger.info("Successfully generated %d LLM recommendations.", len(valid_recommendations))
-        return valid_recommendations[:max_results]
+                source_title = rec.source_title
+                if source_title:
+                    clean_source = _normalize_title(source_title)
+                    if clean_source not in history_titles_lower:
+                        logger.warning(
+                            "LLM returned source_title '%s' not found in history. Clearing.", source_title,
+                        )
+                        source_title = None
+                    else:
+                        stripped = re.sub(r'\s*[-–]\s*S\d+E\d+.*', '', source_title, flags=re.IGNORECASE)
+                        stripped = re.sub(r'\s*\((19|20)\d{2}\)\s*$', '', stripped)
+                        source_title = stripped.strip()
+
+                logger.info("[%s (%s)] — %s", rec.title, rec.year, rec.rationale or "No rationale.")
+                valid_recommendations.append({
+                    "title": rec.title,
+                    "year": rec.year,
+                    "rationale": rec.rationale or "No rationale provided by LLM.",
+                    "source_title": source_title,
+                    "score": None,
+                })
+
+            logger.info("Successfully generated %d LLM recommendations.", len(valid_recommendations))
+            return valid_recommendations[:max_results]
     finally:
         await _close_llm_client(client)
 

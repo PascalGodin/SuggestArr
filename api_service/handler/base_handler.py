@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from api_service.services.llm.llm_service import is_llm_configured, get_recommendations_from_history
 from api_service.services.tmdb.tmdb_discover import TMDbDiscover
 from api_service.config.config import load_env_vars
+from api_service.services.config_service import ConfigService
 
 
 class BaseMediaHandler(ABC):
@@ -260,8 +261,8 @@ class BaseMediaHandler(ABC):
         
         return {"id": 0, "name": "LLM Recommendation"}
     
-    # Maximum candidates shown to the LLM as a selection pool.
-    _MAX_CANDIDATES = 50
+    # Default maximum candidates shown to the LLM — overridden by LLM_MAX_CANDIDATES env var.
+    _DEFAULT_MAX_CANDIDATES = 50
 
     async def _build_candidate_pool(self, history_items: list, item_type: str) -> list:
         """Build a pool of pre-validated TMDb candidates for LLM selection.
@@ -269,7 +270,7 @@ class BaseMediaHandler(ABC):
         Resolves the top watched items to TMDb IDs, fetches similar items for
         each (reusing the same pipeline as the non-LLM path), and appends
         trending items from TMDb. Returns a deduplicated, filter-passing list
-        capped at _MAX_CANDIDATES.
+        capped at LLM_MAX_CANDIDATES (env var, default 50).
 
         Args:
             history_items: List of watched items with 'title' and 'year'.
@@ -394,7 +395,9 @@ class BaseMediaHandler(ABC):
             len(recommended_filtered),
             len(popular_filtered),
         )
-        return filtered[:self._MAX_CANDIDATES]
+        config = ConfigService.get_runtime_config()
+        max_candidates = int(config.get("LLM_MAX_CANDIDATES", self._DEFAULT_MAX_CANDIDATES))
+        return filtered[:max_candidates]
 
     async def process_llm_recommendations(self, user_or_history_items, history_items_or_item_type, item_type_or_max_results, max_results=None):
         """
