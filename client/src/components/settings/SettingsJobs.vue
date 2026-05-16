@@ -496,23 +496,20 @@ export default {
     async runJob(job) {
       this.isRunning[job.id] = true;
       try {
-        this.$toast.open({
-          message: `Running job: ${job.name}...`,
-          type: 'info'
-        });
         const response = await jobsApi.runJobNow(job.id);
         if (response.status === 'success') {
           this.$toast.open({
-            message: `Job completed: ${response.results_count} found, ${response.requested_count} enqueued for Seer`,
+            message: `Job "${job.name}" started — running in background. Check History for results.`,
             type: 'success',
-            duration: 10000
+            duration: 6000
           });
-          await this.loadHistory();
-          // Start polling so the queue banner appears immediately
+          // Poll queue status immediately in case items land quickly
           await this.pollQueueStatus();
+          // Reload history after a short delay so a fast job's entry appears
+          setTimeout(() => this.loadHistory(), 3000);
         } else {
           this.$toast.open({
-            message: response.message || 'Job failed',
+            message: response.message || 'Job failed to start',
             type: 'error'
           });
         }
