@@ -636,8 +636,11 @@ def duplicate_job(job_id: int):
 @limiter.limit("5 per minute")
 def run_job_now(job_id: int):
     """
-    Execute a job immediately.
-    
+    Trigger a job to run immediately in a background thread.
+
+    Returns 202 immediately so the UI stays responsive while the job runs.
+    Use the job history endpoint to see results after completion.
+
     Admin users can run any job.
     Normal users can only run jobs they own.
 
@@ -645,7 +648,7 @@ def run_job_now(job_id: int):
         job_id: ID of the job to run.
 
     Returns:
-        JSON with execution result.
+        JSON 202 once the background thread is launched, or error if job not found.
     """
     try:
         repository = JobRepository()
@@ -654,7 +657,7 @@ def run_job_now(job_id: int):
         job = repository.get_job(job_id)
         if not job:
             return jsonify({'status': 'error', 'message': 'Job not found'}), 404
-        
+
         # Apply RBAC: non-admin users can only run their own jobs
         current_user = getattr(g, 'current_user', None)
         if current_user and current_user.get('role') != 'admin':
@@ -662,46 +665,20 @@ def run_job_now(job_id: int):
             if job.get('owner_id') != user_id:
                 return jsonify({'status': 'error', 'message': 'Insufficient permissions'}), 403
 
-        job_type = job.get('job_type', 'discover')
-        logger.info(f"Running {job_type} job {job_id} immediately")
-
         manager = get_job_manager()
-        if run_async(manager._should_pause_for_pending_requests(job)):
-            exec_id = repository.log_execution_start(job_id)
-            repository.log_execution_end(
-                exec_id=exec_id,
-                status='skipped',
-                results_count=0,
-                requested_count=0,
-                error_message='Paused: Seer has pending requests awaiting approval or denial.'
-            )
-            return jsonify({
-                'status': 'paused',
-                'message': 'Job paused because Seer has pending requests awaiting approval or denial.',
-                'results_count': 0,
-                'requested_count': 0
-            }), 200
+        thread = threading.Thread(
+            target=manager.run_job_now,
+            args=[job_id],
+            daemon=True,
+            name=f"manual-run-job-{job_id}"
+        )
+        thread.start()
 
-        # Execute job based on type (async function called synchronously)
-        if job_type == 'recommendation':
-            result = run_async(execute_recommendation_job(job_id))
-        elif job_type == 'trakt_recommendations':
-            result = run_async(execute_trakt_recommendations_job(job_id))
-        else:
-            result = run_async(execute_discover_job(job_id))
-
-        if result.success:
-            return jsonify({
-                'status': 'success',
-                'message': 'Job executed successfully',
-                'results_count': result.results_count,
-                'requested_count': result.requested_count
-            }), 200
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': result.error_message or 'Job execution failed'
-            }), 500
+        logger.info(f"Triggered background run for {job.get('job_type', 'discover')} job {job_id} ({job.get('name', '')})")
+        return jsonify({
+            'status': 'success',
+            'message': 'Job started in the background',
+        }), 202
 
     except Exception as e:
         logger.error(f"Error running job {job_id}: {e}", exc_info=True)
