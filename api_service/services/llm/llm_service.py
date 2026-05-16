@@ -286,6 +286,9 @@ async def _call_with_validation(
         return "response_format" in detail_text or "json_object" in detail_text
 
     for attempt in range(max_retries + 1):
+        prompt_text = "\n".join(m.get("content", "") for m in current_messages)
+        logger.info("LLM PROMPT (attempt %d):\n%s", attempt + 1, prompt_text)
+
         try:
             response = await client.chat.completions.create(
                 model=model,
@@ -307,6 +310,7 @@ async def _call_with_validation(
                 raise
 
         raw = response.choices[0].message.content.strip()
+        logger.info("LLM RESPONSE (attempt %d):\n%s", attempt + 1, raw)
         content = _extract_json_object(
             _repair_title_qualifiers(_strip_markdown_fences(raw))
         )
