@@ -202,12 +202,7 @@ class JobManager:
             return
 
         self.logger.info(f"Job {job_id} ({job_data['name']}) waiting for available slot...")
-        acquired = self._job_semaphore.acquire(timeout=3600)
-        if not acquired:
-            self.logger.warning(
-                f"Job {job_id} ({job_data['name']}) timed out after 1 hour waiting in queue. Skipping."
-            )
-            return
+        self._job_semaphore.acquire()
 
         self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
         try:
@@ -249,10 +244,20 @@ class JobManager:
                     self.logger.info("Job %s paused because its suggested content remains unwatched.", job_id)
                     return
                 if slices is None:
-                    loop.run_until_complete(executor(job_id, execution_id=execution_id) if execution_id is not None else executor(job_id))
+                    loop.run_until_complete(asyncio.wait_for(
+                        executor(job_id, execution_id=execution_id) if execution_id is not None else executor(job_id),
+                        timeout=3600,
+                    ))
                 else:
                     for overrides in slices:
-                        loop.run_until_complete(executor(job_id, overrides, execution_id=execution_id) if execution_id is not None else executor(job_id, overrides))
+                        loop.run_until_complete(asyncio.wait_for(
+                            executor(job_id, overrides, execution_id=execution_id) if execution_id is not None else executor(job_id, overrides),
+                            timeout=3600,
+                        ))
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Job {job_id} ({job_data['name']}) timed out after 1 hour of execution. Skipping."
+                )
             finally:
                 close_event_loop(loop, self.logger)
 
