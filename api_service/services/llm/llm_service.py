@@ -444,6 +444,9 @@ async def _call_with_validation(
     last_error: Exception = RuntimeError("No attempts made")
 
     for attempt in range(max_retries + 1):
+        prompt_text = "\n".join(m.get("content", "") for m in current_messages)
+        logger.info("LLM PROMPT (attempt %d):\n%s", attempt + 1, prompt_text)
+
         response = None
         for response_format in _response_format_options(schema_cls):
             request_kwargs: Dict[str, Any] = {
@@ -473,6 +476,7 @@ async def _call_with_validation(
             raise RuntimeError("LLM request did not return a response")
 
         raw = response.choices[0].message.content.strip()
+        logger.info("LLM RESPONSE (attempt %d):\n%s", attempt + 1, raw)
         content = _extract_json_object(
             _repair_title_qualifiers(_strip_markdown_fences(raw))
         )
