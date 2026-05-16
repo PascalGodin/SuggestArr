@@ -182,6 +182,9 @@
               <i class="fas fa-edit"></i>
               Edit
             </button>
+            <button @click="duplicateJob(job)" class="btn btn-sm btn-outline" :disabled="isDuplicating[job.id]" title="Duplicate job">
+              <i :class="isDuplicating[job.id] ? 'fas fa-spinner fa-spin' : 'fas fa-copy'"></i>
+            </button>
             <button @click="confirmDeleteJob(job)" class="btn btn-sm btn-danger" title="Delete job">
               <i class="fas fa-trash"></i>
             </button>
@@ -301,6 +304,7 @@ export default {
       isToggling: {},
       isRunning: {},
       isDryRunning: {},
+      isDuplicating: {},
       isDeleting: false,
       showCreateModal: false,
       showHistoryModal: false,
@@ -559,6 +563,30 @@ export default {
 
     editJob(job) {
       this.editingJob = { ...job, filters: { ...job.filters } };
+    },
+
+    async duplicateJob(job) {
+      this.isDuplicating[job.id] = true;
+      try {
+        const response = await jobsApi.duplicateJob(job.id);
+        if (response.status === 'success') {
+          this.$toast.open({
+            message: `Job duplicated as "${response.job.name}" (disabled — review before enabling)`,
+            type: 'success',
+            duration: 4000,
+          });
+          await this.loadJobs();
+        }
+      } catch (error) {
+        console.error('Failed to duplicate job:', error);
+        this.$toast.open({
+          message: 'Failed to duplicate job',
+          type: 'error',
+          duration: 3000,
+        });
+      } finally {
+        this.isDuplicating[job.id] = false;
+      }
     },
 
     confirmDeleteJob(job) {
