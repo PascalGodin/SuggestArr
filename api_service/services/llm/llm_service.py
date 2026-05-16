@@ -535,7 +535,7 @@ async def get_recommendations_from_history(
 
         Rules:
         1. Score EVERY candidate — do not skip any index.
-        2. Score 0–100: 100 = perfect fit, 0 = completely mismatched.
+        2. Score 0–100: 100 = perfect fit, 0 = completely mismatched. Use the FULL range — most scores should fall between 20 and 80. Reserve 85+ for exceptional matches and below 30 for poor fits. Do NOT cluster scores in a narrow band.
         3. The "reason" must be one short sentence explaining why this item fits or does not fit the user's taste (not a plot summary).
         4. Do NOT invent items. Only score items from the lists above.
         5. ONLY respond with a valid JSON object — no markdown, no extra text.

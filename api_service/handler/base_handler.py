@@ -160,7 +160,7 @@ class BaseMediaHandler(ABC):
         return {"id": 0, "name": "LLM Recommendation"}
     
     # Default maximum candidates shown to the LLM — overridden by LLM_MAX_CANDIDATES env var.
-    _DEFAULT_MAX_CANDIDATES = 50
+    _DEFAULT_MAX_CANDIDATES = 25
 
     async def _build_candidate_pool(self, history_items: list, item_type: str) -> list:
         """Build a pool of pre-validated TMDb candidates for LLM selection.
