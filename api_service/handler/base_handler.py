@@ -366,18 +366,33 @@ class BaseMediaHandler(ABC):
         # These are O(1) set lookups using data loaded at handler init — no extra API calls.
         # Per-item checks (already_requested, watch_providers) happen downstream as usual.
         library_ids = self.existing_content_sets.get(item_type, set())
-        filtered = [
-            c for c in candidates
-            if _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
-            and str(c.get('id', '')) not in library_ids
-            and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)
-        ]
+
+        def _rating(c):
+            return float(c.get('rating') or c.get('vote_average') or 0)
+
+        recommended_filtered = sorted(
+            [c for c in candidates
+             if c.get('_candidate_source') == 'recommended'
+             and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
+             and str(c.get('id', '')) not in library_ids
+             and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
+            key=_rating, reverse=True,
+        )
+        popular_filtered = sorted(
+            [c for c in candidates
+             if c.get('_candidate_source') == 'popular'
+             and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
+             and str(c.get('id', '')) not in library_ids
+             and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
+            key=_rating, reverse=True,
+        )
+        filtered = recommended_filtered + popular_filtered
 
         self.logger.info(
-            "Candidate pool: %d items (%d from similar + %d from popular, before cap)",
+            "Candidate pool: %d items (%d recommended + %d popular, before cap)",
             len(filtered),
-            sum(len(lst) for lst in similar_lists),
-            len(popular),
+            len(recommended_filtered),
+            len(popular_filtered),
         )
         return filtered[:self._MAX_CANDIDATES]
 

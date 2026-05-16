@@ -731,7 +731,7 @@ async def get_recommendations_from_history(
                     lines.append(_fmt(c, counter))
                     counter += 1
                 sections.append(
-                    "RECOMMENDED FOR YOU (based on your watch history — highest priority):\n"
+                    "RECOMMENDED FOR YOU (based on your watch history — highest priority, sorted by rating descending):\n"
                     + "\n".join(lines)
                 )
             if popular:
@@ -740,7 +740,7 @@ async def get_recommendations_from_history(
                     lines.append(_fmt(c, counter))
                     counter += 1
                 sections.append(
-                    "CURRENTLY POPULAR (use to fill remaining slots if recommended list is exhausted):\n"
+                    "CURRENTLY POPULAR (use to fill remaining slots if recommended list is exhausted, sorted by rating descending):\n"
                     + "\n".join(lines)
                 )
             candidate_text = "\n\n".join(sections)
