@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 # ---------------------------------------------------------------------------
 
 class RecommendationItem(BaseModel):
-    """A single media recommendation produced by the LLM."""
+    """A single media recommendation produced by the LLM (generation / fallback mode)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29,17 +29,31 @@ class RecommendationItem(BaseModel):
 
 
 class RecommendationList(BaseModel):
-    """Top-level wrapper for the LLM recommendation response.
-
-    Wrapping the array in an object is required so that JSON-object mode (used
-    by OpenAI-compatible providers) can be activated — those APIs require the
-    root JSON value to be an object, not a bare array.
-    """
+    """Top-level wrapper for the LLM recommendation response (generation / fallback mode)."""
 
     model_config = ConfigDict(extra="forbid")
 
     taste_profile: Optional[str] = None
     recommendations: list[RecommendationItem]
+
+
+class CandidateScore(BaseModel):
+    """Score and fit rationale for a single candidate in scoring mode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    score: int
+    reason: str
+
+
+class CandidateScoringResponse(BaseModel):
+    """Top-level wrapper for the LLM candidate-scoring response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    taste_profile: str
+    scores: list[CandidateScore]
 
 
 # ---------------------------------------------------------------------------
