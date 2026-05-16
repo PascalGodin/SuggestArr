@@ -534,15 +534,15 @@ async def get_recommendations_from_history(
         3. Prioritise items from the RECOMMENDED FOR YOU list — they are personalised to the user's history.
         4. Only draw from CURRENTLY POPULAR when you need to fill remaining slots.
         5. ONLY respond with a valid JSON object with a single key "recommendations" containing an array of objects.
-        6. Each object MUST have: a "title" string (exact title from the lists), a "year" integer (exact year from the lists), and a "rationale" string explaining why it fits the user's taste.
+        6. Each object MUST have: a "title" string (exact title from the lists), a "year" integer (exact year from the lists), a "rationale" string explaining why it fits the user's taste, and a "source_title" string containing the EXACT title (from the watch history above) of the watched item that most inspired this recommendation.
         7. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
         8. The "title" field must be a plain JSON string without extra qualifiers outside the string.
 
         Example format:
         {{
           "recommendations": [
-            {{"title": "Example Movie", "year": 2023, "rationale": "Shares the same dark atmosphere as..."}},
-            {{"title": "Another Film", "year": 1999, "rationale": "Similar themes of redemption to..."}}
+            {{"title": "Example Movie", "year": 2023, "source_title": "Watched Show", "rationale": "Shares the same dark atmosphere as..."}},
+            {{"title": "Another Film", "year": 1999, "source_title": "Another Watched Show", "rationale": "Similar themes of redemption to..."}}
           ]
         }}
     """
