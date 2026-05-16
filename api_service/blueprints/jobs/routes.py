@@ -588,6 +588,50 @@ def toggle_job(job_id: int):
         return jsonify({'status': 'error', 'message': 'An internal error occurred'}), 500
 
 
+@jobs_bp.route('/<int:job_id>/duplicate', methods=['POST'])
+def duplicate_job(job_id: int):
+    """
+    Duplicate an existing job.
+
+    Creates a copy with the same configuration, owned by the current user,
+    with ' (Copy)' appended to the name and enabled set to False so the user
+    can review it before activating.
+
+    Admin users can duplicate any job. Normal users can only duplicate jobs they own.
+
+    Args:
+        job_id: ID of the job to duplicate.
+
+    Returns:
+        JSON with the created job object.
+    """
+    try:
+        repository = JobRepository()
+
+        job = repository.get_job(job_id)
+        if not job:
+            return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+
+        current_user = getattr(g, 'current_user', None)
+        if current_user and current_user.get('role') != 'admin':
+            user_id = int(current_user['id'])
+            if job.get('owner_id') != user_id:
+                return jsonify({'status': 'error', 'message': 'Insufficient permissions'}), 403
+
+        owner_id = int(current_user['id']) if current_user else None
+        new_id = repository.duplicate_job(job_id, owner_id=owner_id)
+        if new_id is None:
+            return jsonify({'status': 'error', 'message': 'Failed to duplicate job'}), 500
+
+        new_job = repository.get_job(new_id)
+        logger.info(f"Duplicated job {job_id} as job {new_id}")
+        return jsonify({'status': 'success', 'job': new_job}), 201
+
+    except Exception as e:
+        logger.error(f"Error duplicating job {job_id}: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': 'An internal error occurred'}), 500
+
+
 @jobs_bp.route('/<int:job_id>/run', methods=['POST'])
 @limiter.limit("5 per minute")
 def run_job_now(job_id: int):
