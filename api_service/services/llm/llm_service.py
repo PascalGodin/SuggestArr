@@ -533,16 +533,23 @@ async def get_recommendations_from_history(
         2. Do NOT select any {list_type} the user has already watched (listed above).
         3. Prioritise items from the RECOMMENDED FOR YOU list — they are personalised to the user's history.
         4. Only draw from CURRENTLY POPULAR when you need to fill remaining slots.
-        5. ONLY respond with a valid JSON object with a single key "recommendations" containing an array of objects.
-        6. Each object MUST have: a "title" string (exact title from the lists), a "year" integer (exact year from the lists), a "rationale" string explaining why it fits the user's taste, and a "source_title" string containing the EXACT title (from the watch history above) of the watched item that most inspired this recommendation.
+        5. ONLY respond with a valid JSON object with the following keys:
+           - "taste_profile": a single sentence summarising the user's taste based on their watch history.
+           - "recommendations": an array of exactly {max_results} objects.
+        6. Each recommendation object MUST have:
+           - "title": exact title from the lists (plain string, no extra qualifiers outside it)
+           - "year": exact year from the lists (integer)
+           - "source_title": EXACT title from the watch history that most inspired this pick
+           - "rationale": one sentence explaining why it fits the user's taste
+           - "score": integer 0–100 representing how well this item matches the user's taste profile
         7. Do NOT wrap the JSON in markdown code blocks. Do not add any conversational text.
-        8. The "title" field must be a plain JSON string without extra qualifiers outside the string.
 
         Example format:
         {{
+          "taste_profile": "The user enjoys light-hearted family comedies with relatable characters.",
           "recommendations": [
-            {{"title": "Example Movie", "year": 2023, "source_title": "Watched Show", "rationale": "Shares the same dark atmosphere as..."}},
-            {{"title": "Another Film", "year": 1999, "source_title": "Another Watched Show", "rationale": "Similar themes of redemption to..."}}
+            {{"title": "Example Movie", "year": 2023, "source_title": "Watched Show", "rationale": "Shares the same warm humour as...", "score": 87}},
+            {{"title": "Another Film", "year": 1999, "source_title": "Another Watched Show", "rationale": "Similar family dynamics to...", "score": 74}}
           ]
         }}
     """
@@ -608,6 +615,9 @@ async def get_recommendations_from_history(
             )
             return []
 
+        if validated.taste_profile:
+            logger.info("LLM taste profile: %s", validated.taste_profile)
+
         valid_recommendations: List[Dict] = []
         for rec in validated.recommendations:
             rec_title = rec.title.strip().lower()
@@ -637,9 +647,11 @@ async def get_recommendations_from_history(
                 "year": rec.year,
                 "rationale": rec.rationale or "No rationale provided by LLM.",
                 "source_title": source_title,
+                "score": rec.score,
             }
+            score_str = f"{rec.score}%" if rec.score is not None else "n/a"
             logger.debug(
-                "[%s (%s)] LLM Rationale: %s", rec.title, rec.year, rec_dict["rationale"]
+                "[%s (%s)] score=%s — %s", rec.title, rec.year, score_str, rec_dict["rationale"]
             )
             valid_recommendations.append(rec_dict)
 

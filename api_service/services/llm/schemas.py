@@ -25,6 +25,7 @@ class RecommendationItem(BaseModel):
     year: int
     rationale: str
     source_title: Optional[str] = None
+    score: Optional[int] = None
 
 
 class RecommendationList(BaseModel):
@@ -37,6 +38,7 @@ class RecommendationList(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    taste_profile: Optional[str] = None
     recommendations: list[RecommendationItem]
 
 
