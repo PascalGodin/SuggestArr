@@ -271,11 +271,17 @@ class BaseMediaHandler(ABC):
 
         Resolves the top watched items to TMDb IDs, fetches similar items for
         each (reusing the same pipeline as the non-LLM path), and appends
-        trending items from TMDb. Candidates are ranked by genre affinity with
-        the user's watch history first, rating second, then capped at
-        LLM_MAX_CANDIDATES (env var, default 25) — this keeps the cap from being
-        dominated by high-rated but off-theme items (e.g. a niche high-rated
-        title in a genre the user never watches).
+        trending items from TMDb. The job's configured quality filters (rating
+        and vote-count thresholds, include_no_ratings, language, release year,
+        genre include/exclude) are applied to the whole pool before ranking, so
+        candidates the job would never allow don't occupy slots that a genuinely
+        matching candidate could have used. Candidates are then ranked by genre
+        affinity with the user's watch history first, rating second, and capped
+        at LLM_MAX_CANDIDATES (env var, default 25) — this keeps the cap from
+        being dominated by high-rated but off-theme items (e.g. a niche
+        high-rated title in a genre the user never watches). Finally, the
+        capped list is checked against excluded streaming services (a no-op
+        network-wise when that filter isn't configured).
 
         Args:
             history_items: List of watched items with 'title' and 'year'.
@@ -378,6 +384,20 @@ class BaseMediaHandler(ABC):
                 item['_candidate_source'] = 'popular'
                 candidates.append(item)
 
+        # Apply the job's quality filters (rating/votes incl. include_no_ratings,
+        # language, release year, genre include/exclude) up front, to the whole
+        # pool — not just the one item the LLM eventually picks. Without this,
+        # candidates the job is configured to reject can still occupy slots in
+        # the capped pool, wasting LLM attention on choices it was never allowed
+        # to make.
+        before_quality_filter = len(candidates)
+        candidates = [c for c in candidates if tc._apply_filters(c, item_type).get('passed', True)]
+        if len(candidates) != before_quality_filter:
+            self.logger.debug(
+                "Candidate pool: quality filters removed %d/%d candidates",
+                before_quality_filter - len(candidates), before_quality_filter,
+            )
+
         # Inverse document frequency: genres shared by nearly every candidate (e.g.
         # "Drama", "Action" are on half of TMDb) are poor discriminators and get a
         # low weight; genres that only a subset of candidates carry are much more
@@ -402,7 +422,8 @@ class BaseMediaHandler(ABC):
 
         # Remove items already in the library or already discovered by Seerr.
         # These are O(1) set lookups using data loaded at handler init — no extra API calls.
-        # Per-item checks (already_requested, watch_providers) happen downstream as usual.
+        # already_requested is still checked downstream as usual; streaming-service
+        # exclusion is applied later in this function, after the pool is capped.
         library_ids = self.existing_content_sets.get(item_type, set())
 
         def _rating(c):
@@ -434,7 +455,23 @@ class BaseMediaHandler(ABC):
         )
         config = ConfigService.get_runtime_config()
         max_candidates = int(config.get("LLM_MAX_CANDIDATES", self._DEFAULT_MAX_CANDIDATES))
-        return filtered[:max_candidates]
+        capped = filtered[:max_candidates]
+
+        # Streaming-service exclusion is a per-item network call (skipped internally
+        # when no region/excluded services are configured), so it's applied last,
+        # only to the already-capped pool — bounded cost instead of one call per
+        # raw candidate before the cap.
+        async def _passes_streaming_filter(c):
+            is_excluded, provider = await tc.get_watch_providers(c.get('id'), item_type)
+            if is_excluded:
+                self.logger.debug(
+                    "Candidate pool: excluding '%s' — available on excluded service %s",
+                    c.get('title') or c.get('name') or 'Unknown', provider,
+                )
+            return not is_excluded
+
+        keep_flags = await asyncio.gather(*[_passes_streaming_filter(c) for c in capped])
+        return [c for c, keep in zip(capped, keep_flags) if keep]
 
     async def process_llm_recommendations(self, user_or_history_items, history_items_or_item_type, item_type_or_max_results, max_results=None):
         """
