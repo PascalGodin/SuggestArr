@@ -314,11 +314,16 @@ class BaseMediaHandler(ABC):
             try:
                 results = await search_fn(title, year)
                 if not results:
+                    self.logger.info("Candidate pool seed: '%s' (%s) — no TMDb search match", title, year)
                     return [], []
                 matched = results[0]
                 tmdb_id = matched.get('id')
                 if not tmdb_id:
                     return [], []
+                self.logger.info(
+                    "Candidate pool seed: '%s' (%s) -> TMDb '%s' (id=%s, genre_ids=%s)",
+                    title, year, matched.get('title') or matched.get('name'), tmdb_id, matched.get('genre_ids', []),
+                )
                 similar = await similar_fn(tmdb_id)
                 return matched.get('genre_ids', []), similar
             except Exception as exc:
