@@ -3,11 +3,12 @@ Tests for JobManager semaphore queuing behaviour.
 
 Covers:
 - Jobs run sequentially when triggered concurrently (semaphore enforced)
-- A job is skipped cleanly if it cannot acquire the slot within the timeout
+- A job that runs past the 1-hour execution timeout is skipped cleanly
 - Semaphore is always released even when the executor raises
 - Jobs with missing data or no registered executor are rejected before queuing
 """
 
+import asyncio
 import threading
 import time
 import unittest
@@ -136,22 +137,19 @@ class TestJobManagerSemaphore(unittest.TestCase):
     # Timeout / skip
     # ------------------------------------------------------------------
 
-    def test_job_skipped_when_semaphore_not_available(self):
-        """A job that cannot get the slot skips execution without calling the executor."""
+    def test_job_skipped_when_execution_exceeds_timeout(self):
+        """A job whose execution exceeds the 1-hour cap is skipped cleanly."""
         manager = _make_manager()
 
-        called_executor = []
+        async def hangs_forever(_jid):
+            raise asyncio.TimeoutError()
 
-        async def tracking_executor(jid):
-            called_executor.append(jid)
-
-        manager.set_job_executor(tracking_executor, "discover")
+        manager.set_job_executor(hangs_forever, "discover")
         manager.repository.get_job.return_value = self._fake_job_data()
 
-        with patch.object(manager._job_semaphore, "acquire", return_value=False):
-            manager._execute_job(1)
+        manager._execute_job(1)
 
-        self.assertEqual(called_executor, [], "Executor must not run when slot is unavailable")
+        self.assertEqual(manager._job_semaphore._value, 1, "Semaphore must be released after a timeout")
 
 
 if __name__ == "__main__":
