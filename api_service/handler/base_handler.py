@@ -2,8 +2,10 @@
 Base media handler with shared logic for Plex and Jellyfin handlers.
 """
 import asyncio
+import math
 import re
 from abc import ABC, abstractmethod
+from collections import Counter
 from api_service.services.llm.llm_service import is_llm_configured, get_recommendations_from_history
 from api_service.services.tmdb.tmdb_discover import TMDbDiscover
 from api_service.config.config import load_env_vars
@@ -269,8 +271,11 @@ class BaseMediaHandler(ABC):
 
         Resolves the top watched items to TMDb IDs, fetches similar items for
         each (reusing the same pipeline as the non-LLM path), and appends
-        trending items from TMDb. Returns a deduplicated, filter-passing list
-        capped at LLM_MAX_CANDIDATES (env var, default 50).
+        trending items from TMDb. Candidates are ranked by genre affinity with
+        the user's watch history first, rating second, then capped at
+        LLM_MAX_CANDIDATES (env var, default 25) — this keeps the cap from being
+        dominated by high-rated but off-theme items (e.g. a niche high-rated
+        title in a genre the user never watches).
 
         Args:
             history_items: List of watched items with 'title' and 'year'.
@@ -295,21 +300,24 @@ class BaseMediaHandler(ABC):
         }
 
         async def _get_similar(item):
+            """Return (seed_genre_ids, similar_items) for one watched item."""
             title = item.get('title') or item.get('name') or ''
             year = item.get('year')
             if not title:
-                return []
+                return [], []
             try:
                 results = await search_fn(title, year)
                 if not results:
-                    return []
-                tmdb_id = results[0].get('id')
+                    return [], []
+                matched = results[0]
+                tmdb_id = matched.get('id')
                 if not tmdb_id:
-                    return []
-                return await similar_fn(tmdb_id)
+                    return [], []
+                similar = await similar_fn(tmdb_id)
+                return matched.get('genre_ids', []), similar
             except Exception as exc:
                 self.logger.warning("Candidate pool: error fetching similar for '%s': %s", title, exc)
-                return []
+                return [], []
 
         # Build discover filters for popular items — mirrors the job's quality settings.
         discover_filters: dict = {'sort_by': 'popularity.desc'}
@@ -340,10 +348,17 @@ class BaseMediaHandler(ABC):
                     return await tmdb_discover.discover_movies(discover_filters, max_results=40)
                 return await tmdb_discover.discover_tv(discover_filters, max_results=40)
 
-        similar_lists, popular = await asyncio.gather(
+        seed_results, popular = await asyncio.gather(
             asyncio.gather(*[_get_similar(item) for item in history_items]),
             _fetch_popular(),
         )
+
+        # Term frequency: how often each genre recurs across the user's watch history.
+        genre_term_freq: Counter = Counter()
+        similar_lists = []
+        for seed_genre_ids, similar_items in seed_results:
+            genre_term_freq.update(seed_genre_ids)
+            similar_lists.append(similar_items)
 
         # Deduplicate by TMDb ID; tag each item with its origin so the LLM prompt
         # can present them in separate labeled sections.
@@ -363,6 +378,28 @@ class BaseMediaHandler(ABC):
                 item['_candidate_source'] = 'popular'
                 candidates.append(item)
 
+        # Inverse document frequency: genres shared by nearly every candidate (e.g.
+        # "Drama", "Action" are on half of TMDb) are poor discriminators and get a
+        # low weight; genres that only a subset of candidates carry are much more
+        # telling of a genuine match and get weighted higher. Combined with term
+        # frequency above, this is a lightweight TF-IDF affinity score — candidates
+        # sharing the user's *distinctive* genres outrank same-rated but off-theme
+        # results (e.g. a high-rated WWE special surfacing for a sci-fi watcher).
+        genre_doc_freq: Counter = Counter()
+        for c in candidates:
+            for g in set(c.get('genre_ids') or []):
+                genre_doc_freq[g] += 1
+        total_candidates = len(candidates) or 1
+
+        def _genre_idf(g):
+            return math.log((total_candidates + 1) / (genre_doc_freq.get(g, 0) + 1)) + 1
+
+        def _genre_affinity(c):
+            return sum(
+                genre_term_freq.get(g, 0) * _genre_idf(g)
+                for g in (c.get('genre_ids') or [])
+            )
+
         # Remove items already in the library or already discovered by Seerr.
         # These are O(1) set lookups using data loaded at handler init — no extra API calls.
         # Per-item checks (already_requested, watch_providers) happen downstream as usual.
@@ -377,7 +414,7 @@ class BaseMediaHandler(ABC):
              and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
              and str(c.get('id', '')) not in library_ids
              and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
-            key=_rating, reverse=True,
+            key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True,
         )
         popular_filtered = sorted(
             [c for c in candidates
@@ -385,7 +422,7 @@ class BaseMediaHandler(ABC):
              and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
              and str(c.get('id', '')) not in library_ids
              and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
-            key=_rating, reverse=True,
+            key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True,
         )
         filtered = recommended_filtered + popular_filtered
 
