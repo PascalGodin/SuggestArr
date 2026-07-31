@@ -3,7 +3,7 @@ name: Build and Publish Dev Image to GHCR
 on:
   push:
     branches:
-      - feature/enhanced-ai-recommendations
+      - personnal
 
 permissions:
   contents: read
