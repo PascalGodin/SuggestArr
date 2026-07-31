@@ -764,16 +764,17 @@ async def get_recommendations_from_history(
         Rules:
         1. Score EVERY candidate — do not skip any index.
         2. Score 0–100: 100 = perfect fit, 0 = completely mismatched. Use the FULL range — most scores should fall between 20 and 80. Reserve 85+ for exceptional matches and below 30 for poor fits. Do NOT cluster scores in a narrow band.
-        3. The "reason" must be one short sentence explaining why this item fits or does not fit the user's taste (not a plot summary).
+        3. The "reason" must be one short sentence explaining why THIS SPECIFIC item fits or does not fit the user's taste, grounded in its own genres/themes listed above (not a plot summary). Never reuse the wording of another item's reason or of the example below — each reason must be specific to that candidate.
         4. Do NOT invent items. Only score items from the lists above.
         5. ONLY respond with a valid JSON object — no markdown, no extra text.
 
-        Response format:
+        Response format (the "reason" text below is illustrative only — replace it
+        with wording specific to each real candidate's own genres/themes, never copy it):
         {{
           "taste_profile": "One sentence summarising the user's taste.",
           "scores": [
-            {{"index": 1, "score": 87, "reason": "Matches the user's love of dark sci-fi thriller pacing"}},
-            {{"index": 2, "score": 34, "reason": "Too slow and romance-focused for this action-oriented viewer"}},
+            {{"index": 1, "score": 87, "reason": "<your own reason for THIS candidate>"}},
+            {{"index": 2, "score": 34, "reason": "<your own reason for THIS candidate>"}},
             ...
           ]
         }}
