@@ -1,17 +1,21 @@
 """
-Tests for the genre-affinity ranking in BaseMediaHandler._build_candidate_pool.
+Tests for BaseMediaHandler._build_candidate_pool:
 
-Candidates are ranked by a TF-IDF-style genre affinity score before rating,
-so a candidate sharing the user's distinctive genres outranks a same-or-higher
-rated candidate that only shares a genre common across the whole candidate pool
-(e.g. a WWE special surfacing for a sci-fi watcher because "Action" is on
-everything).
+- Candidates are ranked by a TF-IDF-style genre affinity score before rating,
+  so a candidate sharing the user's distinctive genres outranks a same-or-higher
+  rated candidate that only shares a genre common across the whole candidate pool
+  (e.g. a WWE special surfacing for a sci-fi watcher because "Action" is on
+  everything).
+- The job's quality filters (rating/votes incl. include_no_ratings, language,
+  year, genre) are applied to the whole pool before ranking/capping.
+- Excluded streaming services are checked on the final capped pool.
 """
 
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from api_service.handler.base_handler import BaseMediaHandler
+from api_service.services.tmdb.tmdb_client import TMDbClient
 
 SCIFI_GENRE = 878
 ADVENTURE_GENRE = 12
@@ -19,7 +23,11 @@ ACTION_GENRE = 28
 
 
 class FakeTMDbClient:
-    """Minimal TMDb client stub covering only what _build_candidate_pool reads."""
+    """Minimal TMDb client stub covering only what _build_candidate_pool reads.
+
+    Quality/streaming filters are permissive no-ops here so the ranking test
+    below exercises only the genre-affinity logic in isolation.
+    """
 
     def __init__(self, seed_map, similar_map):
         self.seed_map = seed_map
@@ -39,6 +47,12 @@ class FakeTMDbClient:
 
     async def find_similar_movies(self, movie_id):
         return self.similar_map.get(movie_id, [])
+
+    def _apply_filters(self, item, content_type):
+        return {"passed": True}
+
+    async def get_watch_providers(self, content_id, content_type):
+        return False, None
 
 
 class FakeTMDbDiscoverContext:
@@ -77,13 +91,36 @@ class RecordingHandler(BaseMediaHandler):
         pass
 
 
-def _item(item_id, title, genre_ids, rating):
+def _item(item_id, title, genre_ids, rating, votes=100):
     return {
         "id": item_id,
         "title": title,
         "rating": rating,
+        "votes": votes,
         "genre_ids": genre_ids,
     }
+
+
+def _real_tmdb_client(**overrides):
+    """Build a real TMDbClient (no network involved unless a test triggers it)
+    so quality-filter tests exercise the production _apply_filters/get_watch_providers
+    logic instead of a hand-rolled stand-in that could drift from it."""
+    kwargs = dict(
+        api_key="fake-key",
+        search_size=40,
+        # Production always coerces these to a real default (60 / 20) when
+        # unset — see recommendation_automation.py — never None.
+        tmdb_threshold=60,
+        tmdb_min_votes=20,
+        include_no_ratings=True,
+        filter_release_year=0,
+        filter_language=None,
+        filter_genre=None,
+        filter_region_provider=None,
+        filter_streaming_services=None,
+    )
+    kwargs.update(overrides)
+    return TMDbClient(**kwargs)
 
 
 class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
@@ -138,6 +175,99 @@ class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
             "despite its lower rating, because Action is not a distinctive "
             "genre in this candidate pool.",
         )
+
+
+class TestQualityFilterIntegration(unittest.IsolatedAsyncioTestCase):
+
+    async def test_low_rated_candidate_is_excluded_from_pool(self):
+        """A candidate below the job's rating threshold never reaches the LLM,
+        instead of only being caught after it's already been selected."""
+        seed_map = {"Seed1": _item(1001, "Seed1", [SCIFI_GENRE], 8.0)}
+        good = _item(501, "Good Match", [SCIFI_GENRE], 8.0)
+        bad = _item(502, "Bad Match", [SCIFI_GENRE], 2.0)
+        similar_map = {1001: [good, bad]}
+
+        tmdb_client = _real_tmdb_client(tmdb_threshold=50, include_no_ratings=True)
+        tmdb_client.search_movie = AsyncMock(side_effect=lambda title, year=None: (
+            [seed_map[title]] if title in seed_map else []
+        ))
+        tmdb_client.find_similar_movies = AsyncMock(side_effect=lambda mid: similar_map.get(mid, []))
+
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([]),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = {c["id"] for c in pool}
+        self.assertIn(501, pool_ids)
+        self.assertNotIn(502, pool_ids, "Candidate below the rating threshold must not reach the LLM")
+
+    async def test_include_no_ratings_false_drops_unrated_candidates(self):
+        """When the job requires a rating, an item with no vote data is dropped."""
+        seed_map = {"Seed1": _item(1001, "Seed1", [SCIFI_GENRE], 8.0)}
+        rated = _item(501, "Rated", [SCIFI_GENRE], 7.0)
+        unrated = {"id": 502, "title": "Unrated", "genre_ids": [SCIFI_GENRE], "rating": None, "votes": None}
+        similar_map = {1001: [rated, unrated]}
+
+        tmdb_client = _real_tmdb_client(include_no_ratings=False)
+        tmdb_client.search_movie = AsyncMock(side_effect=lambda title, year=None: (
+            [seed_map[title]] if title in seed_map else []
+        ))
+        tmdb_client.find_similar_movies = AsyncMock(side_effect=lambda mid: similar_map.get(mid, []))
+
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([]),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = {c["id"] for c in pool}
+        self.assertIn(501, pool_ids)
+        self.assertNotIn(502, pool_ids, "Unrated candidate must be dropped when include_no_ratings is False")
+
+    async def test_streaming_excluded_candidate_is_removed_from_final_pool(self):
+        """A candidate available on an excluded streaming service is dropped
+        from the pool sent to the LLM."""
+        seed_map = {"Seed1": _item(1001, "Seed1", [SCIFI_GENRE], 8.0)}
+        keep = _item(501, "Keep Me", [SCIFI_GENRE], 8.0)
+        drop = _item(502, "Drop Me", [SCIFI_GENRE], 8.0)
+        similar_map = {1001: [keep, drop]}
+
+        tmdb_client = _real_tmdb_client(
+            filter_region_provider="US",
+            filter_streaming_services=[{"provider_id": 8, "provider_name": "Netflix"}],
+        )
+        tmdb_client.search_movie = AsyncMock(side_effect=lambda title, year=None: (
+            [seed_map[title]] if title in seed_map else []
+        ))
+        tmdb_client.find_similar_movies = AsyncMock(side_effect=lambda mid: similar_map.get(mid, []))
+
+        async def fake_get_watch_providers(content_id, content_type):
+            if content_id == 502:
+                return True, "Netflix"
+            return False, None
+
+        tmdb_client.get_watch_providers = fake_get_watch_providers
+
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([]),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = {c["id"] for c in pool}
+        self.assertIn(501, pool_ids)
+        self.assertNotIn(502, pool_ids, "Candidate on an excluded streaming service must be dropped")
 
 
 if __name__ == "__main__":
