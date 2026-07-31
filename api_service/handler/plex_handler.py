@@ -346,7 +346,7 @@ class PlexHandler(BaseMediaHandler):
                     self.honor_seer_discovery
                     and str(media_id) in self.seer_discovered_ids
                 )
-                in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(source_tmdb_obj['id'], media_type)
+                in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(media_id, media_type)
 
                 filter_results = media.get('filter_results', {'passed': True})
                 filter_results['streaming'] = {
@@ -423,23 +423,13 @@ class PlexHandler(BaseMediaHandler):
         tmdb_ids_to_check = [str(m.get('id')) for m in media_to_process if m.get('id')]
         already_requested_set = await self.seer_client.check_requests_exist_batch(media_type, tmdb_ids_to_check)
 
-        # 2. Get watch providers once (if source is not ai_search/fallback)
-        in_excluded_streaming_service = False
-        provider = None
-        if source_tmdb_obj.get('id') != 0:
-            in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(source_tmdb_obj['id'], media_type)
-        
-        if in_excluded_streaming_service:
-            self.logger.info(f"Skipping all similar {media_type} for source {source_tmdb_obj.get('id')}: source is on excluded service {provider}")
-            return
-
         tasks = []
         local_content_set = self.existing_content_sets.get(media_type, set())
 
         for media in media_to_process:
             if not isinstance(media, dict):
                 continue
-            
+
             media_id = str(media.get('id'))
             media_title = media.get('title') or media.get('name') or 'Unknown'
             if media_title is not None and isinstance(media_title, str):
@@ -460,6 +450,16 @@ class PlexHandler(BaseMediaHandler):
                     "Skipping [%s, %s]: already discovered/requested in Seer.",
                     media_type,
                     media_title,
+                )
+                continue
+
+            # Get watch providers for this specific candidate (a no-op call when
+            # no region/excluded services are configured).
+            in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(media.get('id'), media_type)
+            if in_excluded_streaming_service:
+                self.logger.debug(
+                    "Skipping [%s, %s]: excluded by streaming service: %s",
+                    media_type, media_title, provider,
                 )
                 continue
 
