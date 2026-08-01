@@ -110,6 +110,11 @@ class PlexHandler(BaseMediaHandler):
             self.logger.warning("Failed to resolve TMDB ID for Plex item '%s'", title)
             return None
         if not tmdb_id:
+            self.logger.info(
+                "Seed skipped: '%s' has no TMDb provider ID in Plex — "
+                "check the item's metadata agent in Plex if this is unexpected.",
+                title,
+            )
             return None
 
         media_type = 'movie' if item_type == 'movie' else 'tv'
