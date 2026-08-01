@@ -270,6 +270,17 @@ class BaseMediaHandler(ABC):
     # — bounded so a large eligible pool doesn't burst well past TMDb's rate limit.
     _TASTE_METADATA_CONCURRENCY = 15
 
+    # Per-tag-type weight applied to the TF-IDF affinity score. Keywords are
+    # drawn from a vocabulary of thousands of possible values vs. genre's ~19,
+    # so for the same "rarity" a keyword's document frequency is structurally
+    # much lower than a genre's — giving it a much higher IDF regardless of
+    # whether it's actually a stronger taste signal (e.g. two shows sharing an
+    # incidental "texas" setting keyword isn't as telling as sharing all of a
+    # seed's genre tags). These weights damp keyword/director down so one
+    # incidental shared keyword can't outrank a candidate matching every one
+    # of a seed's genres; tune from observed results.
+    _TAG_TYPE_WEIGHT = {'genre': 1.0, 'keyword': 0.5, 'director': 0.4}
+
     async def _build_candidate_pool(self, history_items: list, item_type: str) -> list:
         """Build a pool of pre-validated TMDb candidates for LLM selection.
 
@@ -485,7 +496,10 @@ class BaseMediaHandler(ABC):
             return math.log((total_eligible + 1) / (tag_doc_freq.get(t, 0) + 1)) + 1
 
         def _tag_affinity(c):
-            return sum(tag_term_freq.get(t, 0) * _tag_idf(t) for t in _tags_for(c))
+            return sum(
+                tag_term_freq.get(t, 0) * _tag_idf(t) * self._TAG_TYPE_WEIGHT.get(t[0], 1.0)
+                for t in _tags_for(c)
+            )
 
         # Rank "recommended" (similar-to-history) and "popular" (broad discover)
         # candidates on equal footing — tag affinity is the real signal we care

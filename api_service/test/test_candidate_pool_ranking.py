@@ -252,6 +252,53 @@ class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
             "candidate with no genre, keyword, or director overlap at all.",
         )
 
+    async def test_keyword_weight_cannot_outweigh_a_full_genre_match(self):
+        """Keywords are drawn from a vocabulary of thousands of values vs.
+        genre's ~19, so a rare shared keyword gets a much higher raw IDF than
+        a common shared genre — enough to outrank a candidate matching every
+        one of the seed's genres, on IDF alone. The per-type weighting must
+        keep genre matches ahead of a single incidental keyword match."""
+        G1, G2, G3, G4 = 1, 2, 3, 4
+        RARE_KEYWORD = 999
+
+        seed_map = {"Seed1": _item(1001, "Seed1", [G1, G2, G3, G4], 8.0)}
+
+        genre_match = _item(501, "Matches All Genres", [G1, G2, G3, G4], 5.0)
+        keyword_match = _item(502, "Matches One Rare Keyword", [], 9.0)
+
+        # A large filler pool sharing the same 4 genres makes them common
+        # (low IDF), while the rare keyword stays unique to `keyword_match` —
+        # this is the realistic-scale imbalance that surfaced in production
+        # (a "texas" keyword outranking a full genre match).
+        fillers = [_item(600 + i, f"Filler{i}", [G1, G2, G3, G4], 5.0) for i in range(50)]
+        similar_map = {1001: [genre_match, keyword_match] + fillers}
+
+        taste_map = {
+            1001: {"keyword_ids": [RARE_KEYWORD], "keyword_names": ["rare"], "director": None},
+            502: {"keyword_ids": [RARE_KEYWORD], "keyword_names": ["rare"], "director": None},
+        }
+
+        tmdb_client = FakeTMDbClient(seed_map, similar_map, taste_map=taste_map)
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([]),
+        ), patch(
+            "api_service.handler.base_handler.ConfigService.get_runtime_config",
+            return_value={"LLM_MAX_CANDIDATES": 100},
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = [c["id"] for c in pool]
+        self.assertLess(
+            pool_ids.index(501), pool_ids.index(502),
+            "A candidate matching all 4 of the seed's genres must outrank one "
+            "matching only a single incidental keyword, even though the "
+            "keyword's rarity gives it a higher raw IDF.",
+        )
+
 
 class TestQualityFilterIntegration(unittest.IsolatedAsyncioTestCase):
 
