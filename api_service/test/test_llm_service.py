@@ -724,6 +724,37 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
             user_prompt.index("Percy Jackson"), user_prompt.index("Neighbours"),
         )
 
+    async def test_scoring_mode_prompt_includes_keywords_and_director(self):
+        """Keywords and director are fetched to feed the TF-IDF ranking, but
+        should also render in the prompt line so the LLM's own reasoning has
+        something more specific than genre tags to point at."""
+        candidates = [{
+            "_candidate_source": "recommended",
+            "id": 1,
+            "title": "Interstellar",
+            "genre_ids": [],
+            "keyword_names": ["time travel", "black hole", "father-daughter relationship"],
+            "director": "Christopher Nolan",
+        }]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(json.dumps({
+                "taste_profile": "sci-fi",
+                "scores": [{"index": 1, "score": 80, "reason": "ok"}],
+            }))
+        )
+        history = [{"title": "Inception", "year": 2010}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(
+                history, max_results=1, item_type="movie", candidates=candidates,
+            )
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("time travel", user_prompt)
+        self.assertIn("black hole", user_prompt)
+        self.assertIn("Christopher Nolan", user_prompt)
+
 
 # ---------------------------------------------------------------------------
 # interpret_search_query (async)

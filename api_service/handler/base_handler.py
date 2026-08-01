@@ -266,6 +266,10 @@ class BaseMediaHandler(ABC):
     # Default maximum candidates shown to the LLM — overridden by LLM_MAX_CANDIDATES env var.
     _DEFAULT_MAX_CANDIDATES = 25
 
+    # Max simultaneous TMDb keyword/credits lookups during candidate enrichment
+    # — bounded so a large eligible pool doesn't burst well past TMDb's rate limit.
+    _TASTE_METADATA_CONCURRENCY = 15
+
     async def _build_candidate_pool(self, history_items: list, item_type: str) -> list:
         """Build a pool of pre-validated TMDb candidates for LLM selection.
 
@@ -275,13 +279,15 @@ class BaseMediaHandler(ABC):
         and vote-count thresholds, include_no_ratings, language, release year,
         genre include/exclude) are applied to the whole pool before ranking, so
         candidates the job would never allow don't occupy slots that a genuinely
-        matching candidate could have used. "Recommended" (similar-to-history)
-        and "popular" (broad discover) candidates are then ranked together on
-        equal footing by genre affinity with the user's watch history first,
-        rating second, and capped at LLM_MAX_CANDIDATES (env var, default 25)
-        — this keeps the cap from being dominated by high-rated but off-theme
-        items (e.g. a niche high-rated title in a genre the user never
-        watches), and from a "popular" item losing out to a weaker
+        matching candidate could have used. Every eligible candidate is then
+        enriched with TMDb keywords and director (one combined API call each,
+        bounded concurrency), and "recommended" (similar-to-history) and
+        "popular" (broad discover) candidates are ranked together on equal
+        footing by a combined genre/keyword/director affinity with the user's
+        watch history first, rating second — this keeps the cap (env var
+        LLM_MAX_CANDIDATES, default 25) from being dominated by high-rated but
+        off-theme items (e.g. a niche high-rated title in a genre the user
+        never watches), and from a "popular" item losing out to a weaker
         "recommended" one purely because of where it came from. Finally, the
         capped list is checked against excluded streaming services (a no-op
         network-wise when that filter isn't configured).
@@ -295,6 +301,19 @@ class BaseMediaHandler(ABC):
         """
         search_fn = self.tmdb_client.search_movie if item_type == 'movie' else self.tmdb_client.search_tv
         similar_fn = self.tmdb_client.find_similar_movies if item_type == 'movie' else self.tmdb_client.find_similar_tvshows
+        tc = self.tmdb_client
+
+        # Namespaced so genre IDs, keyword IDs, and director names can never
+        # collide with each other in the term/document-frequency counters
+        # below (TMDb keyword IDs are arbitrary integers that could otherwise
+        # coincide with a genre ID).
+        def _tags_for(c) -> list:
+            tags = [('genre', g) for g in (c.get('genre_ids') or [])]
+            tags += [('keyword', k) for k in (c.get('keyword_ids') or [])]
+            director = c.get('director')
+            if director:
+                tags.append(('director', director))
+            return tags
 
         # Normalise history titles for membership checks (avoid recommending already-watched items).
         def _norm(title: str) -> str:
@@ -309,7 +328,7 @@ class BaseMediaHandler(ABC):
         }
 
         async def _get_similar(item):
-            """Return (seed_genre_ids, similar_items) for one watched item."""
+            """Return (seed_tags, similar_items) for one watched item."""
             title = item.get('title') or item.get('name') or ''
             year = item.get('year')
             if not title:
@@ -327,15 +346,22 @@ class BaseMediaHandler(ABC):
                     "Candidate pool seed: '%s' (%s) -> TMDb '%s' (id=%s, genre_ids=%s)",
                     title, year, matched.get('title') or matched.get('name'), tmdb_id, matched.get('genre_ids', []),
                 )
-                similar = await similar_fn(tmdb_id)
-                return matched.get('genre_ids', []), similar
+                taste, similar = await asyncio.gather(
+                    tc.get_taste_metadata(tmdb_id, item_type),
+                    similar_fn(tmdb_id),
+                )
+                seed_tags = _tags_for({
+                    'genre_ids': matched.get('genre_ids', []),
+                    'keyword_ids': taste.get('keyword_ids', []),
+                    'director': taste.get('director'),
+                })
+                return seed_tags, similar
             except Exception as exc:
                 self.logger.warning("Candidate pool: error fetching similar for '%s': %s", title, exc)
                 return [], []
 
         # Build discover filters for popular items — mirrors the job's quality settings.
         discover_filters: dict = {'sort_by': 'popularity.desc'}
-        tc = self.tmdb_client
         if tc.tmdb_threshold and tc.rating_source != 'imdb':
             discover_filters['vote_average_gte'] = tc.tmdb_threshold / 10
         if tc.tmdb_min_votes and tc.rating_source != 'imdb':
@@ -367,11 +393,12 @@ class BaseMediaHandler(ABC):
             _fetch_popular(),
         )
 
-        # Term frequency: how often each genre recurs across the user's watch history.
-        genre_term_freq: Counter = Counter()
+        # Term frequency: how often each tag (genre, keyword, or director) recurs
+        # across the user's watch history.
+        tag_term_freq: Counter = Counter()
         similar_lists = []
-        for seed_genre_ids, similar_items in seed_results:
-            genre_term_freq.update(seed_genre_ids)
+        for seed_tags, similar_items in seed_results:
+            tag_term_freq.update(seed_tags)
             similar_lists.append(similar_items)
 
         # Deduplicate by TMDb ID; tag each item with its origin so the LLM prompt
@@ -406,28 +433,6 @@ class BaseMediaHandler(ABC):
                 before_quality_filter - len(candidates), before_quality_filter,
             )
 
-        # Inverse document frequency: genres shared by nearly every candidate (e.g.
-        # "Drama", "Action" are on half of TMDb) are poor discriminators and get a
-        # low weight; genres that only a subset of candidates carry are much more
-        # telling of a genuine match and get weighted higher. Combined with term
-        # frequency above, this is a lightweight TF-IDF affinity score — candidates
-        # sharing the user's *distinctive* genres outrank same-rated but off-theme
-        # results (e.g. a high-rated WWE special surfacing for a sci-fi watcher).
-        genre_doc_freq: Counter = Counter()
-        for c in candidates:
-            for g in set(c.get('genre_ids') or []):
-                genre_doc_freq[g] += 1
-        total_candidates = len(candidates) or 1
-
-        def _genre_idf(g):
-            return math.log((total_candidates + 1) / (genre_doc_freq.get(g, 0) + 1)) + 1
-
-        def _genre_affinity(c):
-            return sum(
-                genre_term_freq.get(g, 0) * _genre_idf(g)
-                for g in (c.get('genre_ids') or [])
-            )
-
         # Remove items already in the library or already discovered by Seerr.
         # These are O(1) set lookups using data loaded at handler init — no extra API calls.
         # already_requested is still checked downstream as usual; streaming-service
@@ -437,18 +442,57 @@ class BaseMediaHandler(ABC):
         def _rating(c):
             return float(c.get('rating') or c.get('vote_average') or 0)
 
-        # Rank "recommended" (similar-to-history) and "popular" (broad discover)
-        # candidates on equal footing — genre affinity is the real signal we
-        # care about, and a popular item that matches taste just as well as a
-        # "recommended" one has no principled reason to be pushed to the back
-        # just because of which TMDb endpoint it came from.
         eligible = [
             c for c in candidates
             if _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
             and str(c.get('id', '')) not in library_ids
             and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)
         ]
-        filtered = sorted(eligible, key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True)
+
+        # Enrich every eligible candidate with keywords and director — one
+        # combined API call each, concurrency-bounded so a large pool doesn't
+        # burst well past TMDb's rate limit. Quality filtering already ran
+        # above, so this only pays for candidates that could actually be
+        # selected.
+        taste_semaphore = asyncio.Semaphore(self._TASTE_METADATA_CONCURRENCY)
+
+        async def _enrich(c):
+            async with taste_semaphore:
+                taste = await tc.get_taste_metadata(c.get('id'), item_type)
+            c['keyword_ids'] = taste.get('keyword_ids', [])
+            c['keyword_names'] = taste.get('keyword_names', [])
+            c['director'] = taste.get('director')
+            return c
+
+        eligible = await asyncio.gather(*[_enrich(c) for c in eligible])
+
+        # Inverse document frequency: tags shared by nearly every candidate (e.g.
+        # "Drama", "Action" are on half of TMDb) are poor discriminators and get a
+        # low weight; tags that only a subset of candidates carry — a shared
+        # keyword or director is far rarer than a shared genre — are much more
+        # telling of a genuine match and get weighted higher. Combined with term
+        # frequency above, this is a lightweight TF-IDF affinity score — candidates
+        # sharing the user's *distinctive* genres/keywords/director outrank
+        # same-rated but off-theme results (e.g. a high-rated WWE special
+        # surfacing for a sci-fi watcher).
+        tag_doc_freq: Counter = Counter()
+        for c in eligible:
+            for t in set(_tags_for(c)):
+                tag_doc_freq[t] += 1
+        total_eligible = len(eligible) or 1
+
+        def _tag_idf(t):
+            return math.log((total_eligible + 1) / (tag_doc_freq.get(t, 0) + 1)) + 1
+
+        def _tag_affinity(c):
+            return sum(tag_term_freq.get(t, 0) * _tag_idf(t) for t in _tags_for(c))
+
+        # Rank "recommended" (similar-to-history) and "popular" (broad discover)
+        # candidates on equal footing — tag affinity is the real signal we care
+        # about, and a popular item that matches taste just as well as a
+        # "recommended" one has no principled reason to be pushed to the back
+        # just because of which TMDb endpoint it came from.
+        filtered = sorted(eligible, key=lambda c: (_tag_affinity(c), _rating(c)), reverse=True)
 
         recommended_count = sum(1 for c in filtered if c.get('_candidate_source') == 'recommended')
         self.logger.info(

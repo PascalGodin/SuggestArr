@@ -806,6 +806,55 @@ class TMDbClient(BaseHTTPClient):
 
         return results
 
+    async def get_taste_metadata(self, content_id, content_type):
+        """
+        Fetch TMDb keywords and director for a movie or TV show in one request.
+
+        Uses append_to_response=keywords,credits so both come back alongside
+        the details call rather than two separate round trips. TMDb nests
+        keywords differently per media type: movies under "keywords", TV
+        shows under "results".
+
+        :param content_id: TMDb ID.
+        :param content_type: 'movie' or 'tv'.
+        :return: dict with 'keyword_ids' (list[int]), 'keyword_names'
+            (list[str]), and 'director' (str|None). Empty/None on any failure.
+        """
+        empty = {'keyword_ids': [], 'keyword_names': [], 'director': None}
+        url = (
+            f"{self.tmdb_api_url}/{content_type}/{content_id}"
+            f"?api_key={self.api_key}&append_to_response=keywords,credits"
+        )
+        try:
+            session = await self._get_session()
+            async with session.get(url, timeout=self.REQUEST_TIMEOUT) as response:
+                if response.status not in HTTP_OK:
+                    self.logger.debug(
+                        "Failed to fetch taste metadata for %s ID %s: HTTP %d",
+                        content_type, content_id, response.status,
+                    )
+                    return empty
+                data = await response.json()
+        except aiohttp.ClientError as e:
+            self.logger.debug(
+                "Error fetching taste metadata for %s ID %s: %s",
+                content_type, content_id, str(e).replace(self.api_key, "***"),
+            )
+            return empty
+
+        keywords_block = data.get('keywords') or {}
+        raw_keywords = keywords_block.get('keywords' if content_type == 'movie' else 'results') or []
+        keyword_ids = [k.get('id') for k in raw_keywords if k.get('id') is not None]
+        keyword_names = [k.get('name') for k in raw_keywords if k.get('name')]
+
+        director = None
+        for member in (data.get('credits') or {}).get('crew') or []:
+            if member.get('job') == 'Director':
+                director = member.get('name')
+                break
+
+        return {'keyword_ids': keyword_ids, 'keyword_names': keyword_names, 'director': director}
+
     async def _execute_search(self, url, content_type):
         """Helper to execute search and format results."""
         try:
