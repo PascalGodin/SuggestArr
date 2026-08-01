@@ -753,9 +753,18 @@ async def get_recommendations_from_history(
 
             sorted_scores = sorted(scored.scores, key=lambda s: s.score, reverse=True)
             valid_recommendations: List[Dict] = []
+            seen_indices: set = set()
             for entry in sorted_scores:
                 if len(valid_recommendations) >= max_results:
                     break
+                if entry.index in seen_indices:
+                    # The LLM occasionally emits the same index twice (seen in
+                    # production with two different scores for it) — keep only
+                    # the higher-scoring occurrence, since sorted_scores is
+                    # already sorted descending.
+                    logger.debug("LLM duplicated index %d — ignoring repeat.", entry.index)
+                    continue
+                seen_indices.add(entry.index)
                 candidate = index_to_candidate.get(entry.index)
                 if not candidate:
                     logger.warning("LLM returned unknown index %d — skipping.", entry.index)
