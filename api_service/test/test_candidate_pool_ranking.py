@@ -166,14 +166,48 @@ class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
 
         pool_ids = [c["id"] for c in pool]
 
-        # Both come from the "recommended" (similar-items) section, which is
-        # ranked ahead of "popular" regardless of score — so their relative
-        # order is a direct read on the genre-affinity ranking.
+        # Both come from the "recommended" (similar-items) source, so their
+        # relative order is a direct read on the genre-affinity ranking itself
+        # (recommended and popular candidates are ranked together, not tiered).
         self.assertLess(
             pool_ids.index(501), pool_ids.index(502),
             "Niche sci-fi candidate should outrank the common-action candidate "
             "despite its lower rating, because Action is not a distinctive "
             "genre in this candidate pool.",
+        )
+
+    async def test_popular_candidate_can_outrank_recommended_candidate(self):
+        """'Recommended' (similar-to-history) and 'popular' (broad discover)
+        candidates must compete on genre affinity alone — a popular candidate
+        that actually matches taste should not lose out to a weaker
+        'recommended' candidate just because of where it came from."""
+        seed_map = {"Seed1": _item(1001, "Seed1", [SCIFI_GENRE], 8.0)}
+
+        # No genre overlap with the seed at all — should rank low despite a
+        # high rating and despite being a "recommended" candidate.
+        weak_recommended = _item(501, "Weak Recommended", [], 9.0)
+        similar_map = {1001: [weak_recommended]}
+
+        # Matches the seed's genre exactly, but only surfaces as "popular".
+        strong_popular = _item(502, "Strong Popular", [SCIFI_GENRE], 5.0)
+
+        tmdb_client = FakeTMDbClient(seed_map, similar_map)
+        handler = RecordingHandler(tmdb_client)
+
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([strong_popular]),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = [c["id"] for c in pool]
+        self.assertLess(
+            pool_ids.index(502), pool_ids.index(501),
+            "A popular candidate matching the seed's genre should outrank a "
+            "recommended candidate with no genre overlap at all, regardless "
+            "of source or rating.",
         )
 
 
