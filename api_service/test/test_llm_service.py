@@ -685,6 +685,45 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(titles, ["Percy Jackson", "Merlin"])
 >>>>>>> bdc35c9 (fix: dedupe LLM scoring response by index before selecting top N)
 
+    async def test_scoring_mode_prompt_preserves_candidate_pool_rank_order(self):
+        """Candidates arrive from _build_candidate_pool already ranked by genre
+        affinity, interleaving 'recommended' and 'popular' sources. The prompt
+        must present them in that same order — re-partitioning into a
+        recommended-first, popular-last block would re-impose a source-based
+        ordering the pool-building step deliberately removed."""
+        candidates = [
+            {"_candidate_source": "popular", "id": 1, "title": "Game of Thrones", "genre_ids": []},
+            {"_candidate_source": "recommended", "id": 2, "title": "Percy Jackson", "genre_ids": []},
+            {"_candidate_source": "popular", "id": 3, "title": "Neighbours", "genre_ids": []},
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(json.dumps({
+                "taste_profile": "fantasy adventure",
+                "scores": [
+                    {"index": 1, "score": 50, "reason": "ok"},
+                    {"index": 2, "score": 50, "reason": "ok"},
+                    {"index": 3, "score": 50, "reason": "ok"},
+                ],
+            }))
+        )
+        history = [{"title": "Avatar: The Last Airbender", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(
+                history, max_results=3, item_type="tv", candidates=candidates,
+            )
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertLess(
+            user_prompt.index("Game of Thrones"), user_prompt.index("Percy Jackson"),
+            "A popular candidate ranked ahead of a recommended one must appear "
+            "first in the prompt, not be pushed after all recommended items.",
+        )
+        self.assertLess(
+            user_prompt.index("Percy Jackson"), user_prompt.index("Neighbours"),
+        )
+
 
 # ---------------------------------------------------------------------------
 # interpret_search_query (async)

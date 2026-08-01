@@ -725,29 +725,21 @@ async def get_recommendations_from_history(
                 line = f"{i}. {title} ({year}){meta}"
                 return line + f" — {overview}" if overview else line
 
-            recommended = [c for c in candidates if c.get('_candidate_source') == 'recommended']
-            popular = [c for c in candidates if c.get('_candidate_source') == 'popular']
-
-            sections: List[str] = []
+            # `candidates` arrives pre-ranked by genre affinity with the user's
+            # watch history (then rating) — present it as a single ranked list
+            # rather than splitting back into "recommended"/"popular" blocks,
+            # which would re-impose a source-based ordering the pool-building
+            # step deliberately removed (a broadly-popular title that matches
+            # taste well should not be visually demoted below a weaker
+            # personalised one).
             counter = 1
             index_to_candidate: Dict[int, Dict] = {}
-            for c in recommended:
+            lines: List[str] = []
+            for c in candidates:
                 index_to_candidate[counter] = c
-                sections_line = _fmt(c, counter)
+                lines.append(_fmt(c, counter))
                 counter += 1
-                if len(sections) == 0:
-                    sections.append("RECOMMENDED FOR YOU (personalised, sorted by rating):\n" + sections_line)
-                else:
-                    sections[0] += "\n" + sections_line
-            for c in popular:
-                index_to_candidate[counter] = c
-                sections_line = _fmt(c, counter)
-                counter += 1
-                if len(sections) < 2:
-                    sections.append("CURRENTLY POPULAR (sorted by rating):\n" + sections_line)
-                else:
-                    sections[1] += "\n" + sections_line
-            candidate_text = "\n\n".join(sections)
+            candidate_text = "CANDIDATES (ranked by fit with your watch history):\n" + "\n".join(lines)
 
             prompt = f"""
         You are an expert film and television recommendation system.
