@@ -640,6 +640,36 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NOT evidence that they enjoyed it", prompt)
         self.assertIn("genres: Science Fiction, Thriller", prompt)
 
+    async def test_watched_history_line_includes_same_metadata_as_candidates(self):
+        """The watched-history list previously showed only bare title/year,
+        while candidates got rating/genre/keyword/director — this asymmetry
+        meant the LLM had far less to reason from about what the user
+        actually likes than about what it's picking from. base_handler.py
+        now resolves and attaches this metadata onto history items too
+        (reusing data already fetched for the TF-IDF ranking), so it must
+        render here the same way it does for candidates."""
+        recs = [{"title": "Interstellar", "year": 2014, "source_title": "Inception", "rationale": "ok"}]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(_wrap_recs(recs))
+        )
+        history = [{
+            "title": "Inception",
+            "year": 2010,
+            "rating": 8.8,
+            "genre_names": ["Science Fiction", "Action"],
+            "keyword_names": ["dream", "heist"],
+            "director": "Christopher Nolan",
+        }]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(history, max_results=3, item_type="movie")
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("Science Fiction", user_prompt)
+        self.assertIn("dream", user_prompt)
+        self.assertIn("Christopher Nolan", user_prompt)
+
     async def test_scoring_mode_deduplicates_repeated_index(self):
         """Production logs showed a local LLM emitting the same index twice in
         the 'scores' array with two different scores. Without dedup, both

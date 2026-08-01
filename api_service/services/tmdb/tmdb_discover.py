@@ -15,6 +15,13 @@ REQUEST_TIMEOUT = 10
 CONTENT_PER_PAGE = 20
 RATE_LIMIT_SLEEP = 0.3
 
+# Process-lifetime cache of {media_type: {genre_id: name}} — TMDb's genre
+# taxonomy is small and effectively static, so this is fetched once per
+# media_type rather than on every call. Only successful, non-empty fetches
+# are cached, so a transient failure doesn't wedge the cache as permanently
+# empty for the rest of the process's life.
+_GENRE_NAME_CACHE: Dict[str, Dict[int, str]] = {}
+
 
 class TMDbDiscover:
     """
@@ -521,6 +528,25 @@ class TMDbDiscover:
             self.logger.error(f"HTTP error fetching genres: {str(e)}")
 
         return []
+
+    async def get_genre_names(self, media_type: str) -> Dict[int, str]:
+        """
+        Return a {genre_id: name} map for 'movie' or 'tv', cached for the life
+        of the process — TMDb's genre list is small and effectively static, so
+        there's no need to re-fetch it on every call.
+
+        :param media_type: 'movie' or 'tv'.
+        :return: Dict mapping genre ID to name; empty on fetch failure (not cached).
+        """
+        cached = _GENRE_NAME_CACHE.get(media_type)
+        if cached:
+            return cached
+
+        genres = await self.get_genres(media_type)
+        name_map = {g['id']: g['name'] for g in genres if g.get('id') and g.get('name')}
+        if name_map:
+            _GENRE_NAME_CACHE[media_type] = name_map
+        return name_map
 
     async def get_languages(self) -> List[Dict[str, Any]]:
         """
