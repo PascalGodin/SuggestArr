@@ -130,17 +130,25 @@ class JellyfinHandler(BaseMediaHandler):
             )
             return None
 
-        # Parse date.
+        # Parse date. Jellyfin reports the actual watch timestamp as
+        # UserData.LastPlayedDate, NOT a top-level 'DatePlayed' field — that
+        # field name never appears in a real /Users/{id}/Items response, so
+        # checking it alone silently fell through to DateCreated/PremiereDate
+        # for every item. That's invisible for newly-released shows (their
+        # air date roughly tracks "recent" anyway) but wrong for older shows
+        # watched recently (e.g. a 1999 anime just watched tonight sorting as
+        # if it were watched in 1999).
         date = 0
-        for field in ('DatePlayed', 'DateCreated', 'PremiereDate'):
-            val = item.get(field)
-            if val:
-                try:
-                    from datetime import datetime as dt
-                    date = int(dt.fromisoformat(str(val).replace('Z', '+00:00')).timestamp())
-                except (ValueError, TypeError):
-                    pass
+        user_data = item.get('UserData') or {}
+        for val in (user_data.get('LastPlayedDate'), item.get('DatePlayed'), item.get('DateCreated'), item.get('PremiereDate')):
+            if not val:
+                continue
+            try:
+                from datetime import datetime as dt
+                date = int(dt.fromisoformat(str(val).replace('Z', '+00:00')).timestamp())
                 break
+            except (ValueError, TypeError):
+                continue
 
         source_obj = None
         try:
