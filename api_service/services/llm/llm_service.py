@@ -39,6 +39,84 @@ logger = LoggerManager.get_logger("LLMService")
 # Maximum number of unique history items to send to the LLM.
 MAX_HISTORY_ITEMS = 20
 
+def _preference_signal_label(item: Dict) -> Optional[str]:
+    """Return the "strong positive/negative/recent-neutral" watch label.
+
+    Only history items carry ``preference_signal`` (set in base_handler.py);
+    candidates never do, so this returns None for them and no label leaks
+    into candidate lines.
+    """
+    signal = str(item.get('preference_signal') or '').lower()
+    if not signal:
+        return None
+    if signal in {"positive", "strong_positive", "favorite", "liked"}:
+        return "strong positive signal"
+    if signal in {"negative", "disliked"}:
+        return "negative signal"
+    return "recent/neutral watch"
+
+
+def _tag_metadata_bracket(item: Dict) -> str:
+    """Build the "[recent/neutral watch; rating: X/10; Genre, Genre; keywords: a, b; dir: Name]"
+    metadata bracket shared by both the candidate list and the watched-history
+    list, so the LLM gets the same grounding for what the user already likes
+    as it does for what it's picking from.
+
+    Genre/keyword names are resolved upstream (base_handler.py, which holds
+    the TMDb client) rather than via a hardcoded ID lookup here — this
+    function only ever displays whatever names it's handed. Falls back to a
+    plain ``genres`` string list when TMDb-resolved ``genre_names`` isn't
+    available (e.g. generation-mode fallback).
+
+    :param item: A TMDb-formatted dict; missing fields are simply omitted.
+    :return: The bracket string (with a leading space), or '' if no metadata
+        is available at all.
+    """
+    rating = item.get('rating') or item.get('vote_average')
+    genre_names = item.get('genre_names') or item.get('genres') or []
+    genre_names = [g for g in genre_names if isinstance(g, str) and g.strip()][:3]
+    keyword_names = (item.get('keyword_names') or [])[:4]
+    director = item.get('director')
+    signal_label = _preference_signal_label(item)
+    meta_parts: List[str] = []
+    if signal_label:
+        meta_parts.append(signal_label)
+    if rating:
+        meta_parts.append(f"rating: {float(rating):.1f}/10")
+    if genre_names:
+        meta_parts.append('genres: ' + ', '.join(genre_names))
+    if keyword_names:
+        meta_parts.append('keywords: ' + ', '.join(keyword_names))
+    if director:
+        meta_parts.append(f"dir: {director}")
+    return f" [{'; '.join(meta_parts)}]" if meta_parts else ''
+
+
+def _fmt_item(item: Dict, index: int, date_field: str) -> str:
+    """Format one prompt line: "{i}. Title (Year) [meta] — overview".
+
+    Shared by the watched-history list and the candidate list so the LLM
+    gets identically-structured grounding for both what the user already
+    likes and what it's picking from — previously the watched-history list
+    only ever showed a bare title/year.
+
+    :param item: A TMDb-formatted dict; missing fields are simply omitted.
+    :param index: 1-based line number.
+    :param date_field: 'release_date' (movie) or 'first_air_date' (TV) —
+        checked before falling back to the item's own 'year' (e.g. a watched
+        item's Jellyfin/Plex-reported year, which isn't a TMDb field).
+    """
+    title = item.get('title') or item.get('name') or 'Unknown'
+    raw_date = item.get(date_field) or item.get('release_date') or item.get('first_air_date') or ''
+    year = raw_date[:4] if raw_date else (item.get('year') or '?')
+    overview = (item.get('overview') or '').strip()
+    if len(overview) > 150:
+        overview = overview[:147] + '...'
+    meta = _tag_metadata_bracket(item)
+    line = f"{index}. {title} ({year}){meta}"
+    return line + f" — {overview}" if overview else line
+
+
 _T = TypeVar("_T", bound=BaseModel)
 
 # System message injected on every retry attempt to steer the LLM back on track.
@@ -392,29 +470,6 @@ def _deduplicate_history(history_items: List[Dict]) -> List[Dict]:
     return unique
 
 
-def _format_history_context_item(item: Dict, default_media_type: str) -> str:
-    """Format a compact history item without turning a watch into a like."""
-    title = item.get("title", item.get("name", "Unknown"))
-    year = item.get("year", "Unknown")
-    media_type = item.get("media_type") or item.get("type") or default_media_type
-    signal = str(item.get("preference_signal") or "recent_watch").lower()
-    if signal in {"positive", "strong_positive", "favorite", "liked"}:
-        signal_label = "strong positive signal"
-    elif signal in {"negative", "disliked"}:
-        signal_label = "negative signal"
-    else:
-        signal_label = "recent/neutral watch"
-
-    details = [str(media_type), signal_label]
-    raw_genres = item.get("genres") or []
-    if not isinstance(raw_genres, (list, tuple)):
-        raw_genres = []
-    genres = [genre.strip() for genre in raw_genres if isinstance(genre, str) and genre.strip()]
-    if genres:
-        details.append(f"genres: {', '.join(genres[:4])}")
-    return f"- {title} ({year}) [{'; '.join(details)}]"
-
-
 def _normalize_title(title: str) -> str:
     """Normalize a title for comparison by stripping common decorations.
 
@@ -636,14 +691,10 @@ async def get_recommendations_from_history(
         }
 
         list_type = "movies" if item_type == "movie" else "TV shows"
+        history_date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
         history_text = "\n".join(
-            _format_history_context_item(item, item_type) for item in history_items
-        )
-        web_context = await _get_web_search_context(
-            f"recent {list_type} similar to " + ", ".join(
-                str(item.get("title") or item.get("name") or "") for item in history_items[:5]
-            ),
-            config,
+            _fmt_item(item, i, history_date_field)
+            for i, item in enumerate(history_items, start=1)
         )
 
         constraint_lines: List[str] = []
@@ -694,43 +745,6 @@ async def get_recommendations_from_history(
             # the code — not the LLM — decide the final cut-off.
             date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
 
-            # Static TMDb genre ID → name lookup (covers movies and TV shows).
-            _GENRE_NAMES: Dict[int, str] = {
-                28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
-                80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
-                14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
-                9648: "Mystery", 10749: "Romance", 878: "Science Fiction",
-                10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
-                10759: "Action & Adventure", 10762: "Kids", 10763: "News",
-                10764: "Reality", 10765: "Sci-Fi & Fantasy", 10766: "Soap",
-                10767: "Talk", 10768: "War & Politics",
-            }
-
-            def _fmt(c: Dict, i: int) -> str:
-                title = c.get('title') or c.get('name') or 'Unknown'
-                raw_date = c.get(date_field) or c.get('release_date') or c.get('first_air_date') or ''
-                year = raw_date[:4] if raw_date else '?'
-                overview = (c.get('overview') or '').strip()
-                if len(overview) > 150:
-                    overview = overview[:147] + '...'
-                rating = c.get('rating') or c.get('vote_average')
-                genre_ids = c.get('genre_ids') or []
-                genre_names = [_GENRE_NAMES[gid] for gid in genre_ids if gid in _GENRE_NAMES][:3]
-                keyword_names = (c.get('keyword_names') or [])[:4]
-                director = c.get('director')
-                meta_parts: List[str] = []
-                if rating:
-                    meta_parts.append(f"rating: {float(rating):.1f}/10")
-                if genre_names:
-                    meta_parts.append(', '.join(genre_names))
-                if keyword_names:
-                    meta_parts.append('keywords: ' + ', '.join(keyword_names))
-                if director:
-                    meta_parts.append(f"dir: {director}")
-                meta = f" [{'; '.join(meta_parts)}]" if meta_parts else ''
-                line = f"{i}. {title} ({year}){meta}"
-                return line + f" — {overview}" if overview else line
-
             # `candidates` arrives pre-ranked by genre affinity with the user's
             # watch history (then rating) — present it as a single ranked list
             # rather than splitting back into "recommended"/"popular" blocks,
@@ -743,7 +757,7 @@ async def get_recommendations_from_history(
             lines: List[str] = []
             for c in candidates:
                 index_to_candidate[counter] = c
-                lines.append(_fmt(c, counter))
+                lines.append(_fmt_item(c, counter, date_field))
                 counter += 1
             candidate_text = "CANDIDATES (ranked by fit with your watch history):\n" + "\n".join(lines)
 
@@ -853,6 +867,12 @@ async def get_recommendations_from_history(
         else:
             # Generation mode (fallback): LLM freely suggests titles.
             # Used when no candidate pool could be built.
+            web_context = await _get_web_search_context(
+                f"recent {list_type} similar to " + ", ".join(
+                    str(item.get("title") or item.get("name") or "") for item in history_items[:5]
+                ),
+                config,
+            )
             prompt = f"""
         You are an expert film and television recommendation system.
         The following {list_type} are watch-history context, ordered from most recent to least recent:

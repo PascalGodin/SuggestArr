@@ -366,6 +366,17 @@ class BaseMediaHandler(ABC):
                     'keyword_ids': taste.get('keyword_ids', []),
                     'director': taste.get('director'),
                 })
+                # Attach resolved metadata to the same dict object the caller
+                # passes to get_recommendations_from_history, so the "watched
+                # history" prompt line gets the same rating/genre/keyword/
+                # director/overview grounding the candidate list does —
+                # reusing data already fetched here rather than a second round
+                # trip.
+                item['rating'] = matched.get('rating')
+                item['genre_ids'] = matched.get('genre_ids', [])
+                item['overview'] = matched.get('overview')
+                item['keyword_names'] = taste.get('keyword_names', [])
+                item['director'] = taste.get('director')
                 return seed_tags, similar
             except Exception as exc:
                 self.logger.warning("Candidate pool: error fetching similar for '%s': %s", title, exc)
@@ -399,10 +410,22 @@ class BaseMediaHandler(ABC):
                     return await tmdb_discover.discover_movies(discover_filters, max_results=40)
                 return await tmdb_discover.discover_tv(discover_filters, max_results=40)
 
-        seed_results, popular = await asyncio.gather(
+        async def _fetch_genre_names():
+            async with TMDbDiscover(tc.api_key) as tmdb_discover:
+                return await tmdb_discover.get_genre_names(item_type)
+
+        seed_results, popular, genre_name_map = await asyncio.gather(
             asyncio.gather(*[_get_similar(item) for item in history_items]),
             _fetch_popular(),
+            _fetch_genre_names(),
         )
+
+        def _attach_genre_names(item):
+            genre_ids = item.get('genre_ids') or []
+            item['genre_names'] = [genre_name_map[gid] for gid in genre_ids if gid in genre_name_map][:3]
+
+        for item in history_items:
+            _attach_genre_names(item)
 
         # Term frequency: how often each tag (genre, keyword, or director) recurs
         # across the user's watch history.
@@ -473,6 +496,7 @@ class BaseMediaHandler(ABC):
             c['keyword_ids'] = taste.get('keyword_ids', [])
             c['keyword_names'] = taste.get('keyword_names', [])
             c['director'] = taste.get('director')
+            _attach_genre_names(c)
             return c
 
         eligible = await asyncio.gather(*[_enrich(c) for c in eligible])

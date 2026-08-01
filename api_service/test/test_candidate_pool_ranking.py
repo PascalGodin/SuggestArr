@@ -60,8 +60,9 @@ class FakeTMDbClient:
 
 
 class FakeTMDbDiscoverContext:
-    def __init__(self, popular_items):
+    def __init__(self, popular_items, genre_name_map=None):
         self.popular_items = popular_items
+        self.genre_name_map = genre_name_map or {}
 
     async def __aenter__(self):
         return self
@@ -74,6 +75,9 @@ class FakeTMDbDiscoverContext:
 
     async def discover_tv(self, filters, max_results=40):
         return self.popular_items
+
+    async def get_genre_names(self, media_type):
+        return self.genre_name_map
 
 
 class RecordingHandler(BaseMediaHandler):
@@ -391,6 +395,52 @@ class TestQualityFilterIntegration(unittest.IsolatedAsyncioTestCase):
         pool_ids = {c["id"] for c in pool}
         self.assertIn(501, pool_ids)
         self.assertNotIn(502, pool_ids, "Candidate on an excluded streaming service must be dropped")
+
+
+class TestDynamicGenreNames(unittest.IsolatedAsyncioTestCase):
+    """Genre names are resolved via TMDbDiscover.get_genre_names (cached,
+    fetched from TMDb) rather than a hardcoded ID→name table — these tests
+    supply a fake mapping to prove the resolution is genuinely dynamic."""
+
+    async def test_seed_and_candidate_both_get_resolved_genre_names(self):
+        seed_map = {"Seed1": _item(1001, "Seed1", [SCIFI_GENRE], 8.0)}
+        candidate = _item(501, "Some Movie", [SCIFI_GENRE, ACTION_GENRE], 7.0)
+        similar_map = {1001: [candidate]}
+
+        tmdb_client = FakeTMDbClient(seed_map, similar_map)
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        genre_name_map = {SCIFI_GENRE: "Science Fiction", ACTION_GENRE: "Action"}
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([], genre_name_map=genre_name_map),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        self.assertEqual(pool[0]["genre_names"], ["Science Fiction", "Action"])
+        self.assertEqual(history_items[0]["genre_names"], ["Science Fiction"])
+
+    async def test_unmapped_genre_id_silently_omitted(self):
+        """An ID missing from the fetched map (e.g. TMDb added a genre this
+        list doesn't know about yet) is dropped from display, not an error."""
+        UNMAPPED_GENRE = 424242
+        seed_map = {"Seed1": _item(1001, "Seed1", [UNMAPPED_GENRE], 8.0)}
+        candidate = _item(501, "Some Movie", [SCIFI_GENRE, UNMAPPED_GENRE], 7.0)
+        similar_map = {1001: [candidate]}
+
+        tmdb_client = FakeTMDbClient(seed_map, similar_map)
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        genre_name_map = {SCIFI_GENRE: "Science Fiction"}
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([], genre_name_map=genre_name_map),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        self.assertEqual(pool[0]["genre_names"], ["Science Fiction"])
 
 
 if __name__ == "__main__":

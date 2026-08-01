@@ -388,5 +388,49 @@ class TestGetGenresAndLanguages(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [])
 
 
+# ---------------------------------------------------------------------------
+# get_genre_names (process-lifetime cache over get_genres)
+# ---------------------------------------------------------------------------
+
+class TestGetGenreNames(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        self.disc = _make_discover()
+        from api_service.services.tmdb import tmdb_discover as module
+        self._cache = module._GENRE_NAME_CACHE
+        self._cache.clear()
+
+    def tearDown(self):
+        self._cache.clear()
+
+    async def test_returns_id_to_name_map(self):
+        payload = {'genres': [{'id': 28, 'name': 'Action'}, {'id': 18, 'name': 'Drama'}]}
+        resp = _mock_response(200, payload)
+        session = _mock_session(resp)
+        with patch.object(self.disc, '_get_session', AsyncMock(return_value=session)):
+            result = await self.disc.get_genre_names('movie')
+        self.assertEqual(result, {28: 'Action', 18: 'Drama'})
+
+    async def test_second_call_uses_cache_without_refetching(self):
+        payload = {'genres': [{'id': 28, 'name': 'Action'}]}
+        resp = _mock_response(200, payload)
+        session = _mock_session(resp)
+        with patch.object(self.disc, '_get_session', AsyncMock(return_value=session)) as get_session:
+            await self.disc.get_genre_names('movie')
+            await self.disc.get_genre_names('movie')
+        get_session.assert_awaited_once()
+
+    async def test_failed_fetch_is_not_cached_and_retries_next_call(self):
+        fail_resp = _mock_response(500)
+        ok_resp = _mock_response(200, {'genres': [{'id': 28, 'name': 'Action'}]})
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[fail_resp, ok_resp])
+        with patch.object(self.disc, '_get_session', AsyncMock(return_value=session)):
+            first = await self.disc.get_genre_names('movie')
+            second = await self.disc.get_genre_names('movie')
+        self.assertEqual(first, {})
+        self.assertEqual(second, {28: 'Action'})
+
+
 if __name__ == '__main__':
     unittest.main()
