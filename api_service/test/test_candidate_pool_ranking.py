@@ -29,9 +29,10 @@ class FakeTMDbClient:
     below exercises only the genre-affinity logic in isolation.
     """
 
-    def __init__(self, seed_map, similar_map):
+    def __init__(self, seed_map, similar_map, taste_map=None):
         self.seed_map = seed_map
         self.similar_map = similar_map
+        self.taste_map = taste_map or {}
         self.tmdb_threshold = None
         self.tmdb_min_votes = None
         self.rating_source = "tmdb"
@@ -53,6 +54,9 @@ class FakeTMDbClient:
 
     async def get_watch_providers(self, content_id, content_type):
         return False, None
+
+    async def get_taste_metadata(self, content_id, content_type):
+        return self.taste_map.get(content_id, {"keyword_ids": [], "keyword_names": [], "director": None})
 
 
 class FakeTMDbDiscoverContext:
@@ -120,7 +124,12 @@ def _real_tmdb_client(**overrides):
         filter_streaming_services=None,
     )
     kwargs.update(overrides)
-    return TMDbClient(**kwargs)
+    client = TMDbClient(**kwargs)
+    # Real network call otherwise — no keywords/director needed for these tests.
+    client.get_taste_metadata = AsyncMock(
+        return_value={"keyword_ids": [], "keyword_names": [], "director": None}
+    )
+    return client
 
 
 class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
@@ -208,6 +217,39 @@ class TestGenreAffinityRanking(unittest.IsolatedAsyncioTestCase):
             "A popular candidate matching the seed's genre should outrank a "
             "recommended candidate with no genre overlap at all, regardless "
             "of source or rating.",
+        )
+
+    async def test_keyword_and_director_affinity_can_outrank_genre_alone(self):
+        """Genre_ids are empty for every item here, so the only possible
+        differentiator is a shared keyword/director — proving those signals
+        genuinely feed the ranking rather than being decorative."""
+        seed_map = {"Seed1": _item(1001, "Seed1", [], 8.0)}
+
+        keyword_match = _item(501, "Keyword Match", [], 6.0)
+        no_match = _item(502, "No Match", [], 9.0)
+        similar_map = {1001: [keyword_match, no_match]}
+
+        taste_map = {
+            1001: {"keyword_ids": [999], "keyword_names": ["time travel"], "director": "Some Director"},
+            501: {"keyword_ids": [999], "keyword_names": ["time travel"], "director": None},
+            502: {"keyword_ids": [], "keyword_names": [], "director": None},
+        }
+
+        tmdb_client = FakeTMDbClient(seed_map, similar_map, taste_map=taste_map)
+        handler = RecordingHandler(tmdb_client)
+        history_items = [{"title": "Seed1", "year": 2020}]
+
+        with patch(
+            "api_service.handler.base_handler.TMDbDiscover",
+            return_value=FakeTMDbDiscoverContext([]),
+        ):
+            pool = await handler._build_candidate_pool(history_items, "movie")
+
+        pool_ids = [c["id"] for c in pool]
+        self.assertLess(
+            pool_ids.index(501), pool_ids.index(502),
+            "Candidate sharing the seed's keyword should outrank a higher-rated "
+            "candidate with no genre, keyword, or director overlap at all.",
         )
 
 

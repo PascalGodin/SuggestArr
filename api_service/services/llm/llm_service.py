@@ -657,11 +657,17 @@ async def get_recommendations_from_history(
                 rating = c.get('rating') or c.get('vote_average')
                 genre_ids = c.get('genre_ids') or []
                 genre_names = [_GENRE_NAMES[gid] for gid in genre_ids if gid in _GENRE_NAMES][:3]
+                keyword_names = (c.get('keyword_names') or [])[:4]
+                director = c.get('director')
                 meta_parts: List[str] = []
                 if rating:
                     meta_parts.append(f"rating: {float(rating):.1f}/10")
                 if genre_names:
                     meta_parts.append(', '.join(genre_names))
+                if keyword_names:
+                    meta_parts.append('keywords: ' + ', '.join(keyword_names))
+                if director:
+                    meta_parts.append(f"dir: {director}")
                 meta = f" [{'; '.join(meta_parts)}]" if meta_parts else ''
                 line = f"{i}. {title} ({year}){meta}"
                 return line + f" — {overview}" if overview else line
