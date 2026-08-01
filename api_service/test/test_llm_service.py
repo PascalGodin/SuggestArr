@@ -651,6 +651,40 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
         prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("Current web-search context: result", prompt)
 
+    async def test_scoring_mode_deduplicates_repeated_index(self):
+        """Production logs showed a local LLM emitting the same index twice in
+        the 'scores' array with two different scores. Without dedup, both
+        occurrences of the higher-scoring duplicate could fill valid_recommendations
+        before a genuinely different candidate is ever considered."""
+        candidates = [
+            {"_candidate_source": "recommended", "id": 1, "title": "Percy Jackson", "genre_ids": []},
+            {"_candidate_source": "recommended", "id": 2, "title": "Merlin", "genre_ids": []},
+        ]
+        # index 1 appears twice (scores 90 and 95) — the duplicate must not
+        # consume the slot that index 2 should get.
+        scoring_payload = json.dumps({
+            "taste_profile": "high-fantasy adventure",
+            "scores": [
+                {"index": 1, "score": 90, "reason": "first occurrence"},
+                {"index": 1, "score": 95, "reason": "duplicate occurrence"},
+                {"index": 2, "score": 50, "reason": "Merlin fits the fantasy theme"},
+            ],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(scoring_payload)
+        )
+        history = [{"title": "Avatar: The Last Airbender", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            result = await get_recommendations_from_history(
+                history, max_results=2, item_type="tv", candidates=candidates,
+            )
+
+        titles = [r["title"] for r in result]
+        self.assertEqual(titles, ["Percy Jackson", "Merlin"])
+>>>>>>> bdc35c9 (fix: dedupe LLM scoring response by index before selecting top N)
+
 
 # ---------------------------------------------------------------------------
 # interpret_search_query (async)
