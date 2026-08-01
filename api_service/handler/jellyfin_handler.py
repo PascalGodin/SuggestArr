@@ -123,6 +123,11 @@ class JellyfinHandler(BaseMediaHandler):
                     except Exception:
                         pass
         if not tmdb_id:
+            self.logger.info(
+                "Seed skipped: '%s' has no TMDb provider ID in Jellyfin (only %s available) — "
+                "check the item's metadata provider in Jellyfin if this is unexpected.",
+                title, list((item.get('SeriesProviderIds') or item.get('ProviderIds') or {}).keys()) or 'none',
+            )
             return None
 
         # Parse date.
