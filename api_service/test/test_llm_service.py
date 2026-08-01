@@ -48,7 +48,7 @@ from api_service.services.llm.llm_service import (
     get_recommendations_from_history,
     interpret_search_query,
 )
-from api_service.services.llm.schemas import RecommendationList, SearchQueryInterpretation
+from api_service.services.llm.schemas import CandidateScoringResponse, RecommendationList, SearchQueryInterpretation
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +339,66 @@ class TestCallWithValidation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.recommendations[0].title, "Se7en")
         # Two calls: first failure + one retry
         self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    async def test_extra_validate_rejects_incomplete_response_and_retries(self):
+        """Reproduces the production bug: a response that structurally passes
+        schema validation (every field is the right type) but is semantically
+        incomplete — here, only 1 of 3 candidates scored, as happens when a
+        local LLM corrupts its own JSON mid-generation and the rest of the
+        array ends up as literal text inside one entry's 'reason' string."""
+        incomplete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "ok, rest got swallowed as text"}],
+        })
+        complete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [
+                {"index": 1, "score": 80, "reason": "ok"},
+                {"index": 2, "score": 50, "reason": "ok"},
+                {"index": 3, "score": 30, "reason": "ok"},
+            ],
+        })
+        client = self._make_client(
+            _mock_openai_response(incomplete_payload),
+            _mock_openai_response(complete_payload),
+        )
+
+        def extra_validate(scored):
+            if len(scored.scores) < 3 * 0.6:
+                return "incomplete"
+            return None
+
+        result = await _call_with_validation(
+            client=client,
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "score"}],
+            schema_cls=CandidateScoringResponse,
+            max_retries=2,
+            extra_validate=extra_validate,
+        )
+
+        self.assertEqual(len(result.scores), 3)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    async def test_extra_validate_exhausts_retries_and_raises(self):
+        payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "ok"}],
+        })
+        client = self._make_client(
+            _mock_openai_response(payload),
+            _mock_openai_response(payload),
+        )
+
+        with self.assertRaises(LLMValidationError):
+            await _call_with_validation(
+                client=client,
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "score"}],
+                schema_cls=CandidateScoringResponse,
+                max_retries=1,
+                extra_validate=lambda scored: "always incomplete",
+            )
 
     async def test_retry_injects_corrective_system_message(self):
         bad_payload = json.dumps({"wrong_key": []})
@@ -669,6 +729,44 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Science Fiction", user_prompt)
         self.assertIn("dream", user_prompt)
         self.assertIn("Christopher Nolan", user_prompt)
+
+    async def test_scoring_mode_retries_when_response_covers_too_few_candidates(self):
+        """End-to-end version of the production incident: 25 candidates sent,
+        but the LLM's JSON corrupts mid-generation so only a handful actually
+        get scored (the rest end up as literal text inside one candidate's
+        'reason' field — still schema-valid, since 'reason' is just a string).
+        get_recommendations_from_history must reject that response and retry
+        rather than silently proceeding with a mostly-unscored candidate pool."""
+        candidates = [
+            {"_candidate_source": "recommended", "id": i, "title": f"Show {i}", "genre_ids": []}
+            for i in range(1, 11)  # 10 candidates
+        ]
+        # Only 2 of 10 scored — well under the 60% completeness floor.
+        incomplete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [
+                {"index": 1, "score": 80, "reason": "ok"},
+                {"index": 2, "score": 70, "reason": "ok"},
+            ],
+        })
+        complete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": i, "score": 100 - i, "reason": "ok"} for i in range(1, 11)],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=[
+            _mock_openai_response(incomplete_payload),
+            _mock_openai_response(complete_payload),
+        ])
+        history = [{"title": "Avatar", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            result = await get_recommendations_from_history(
+                history, max_results=5, item_type="tv", candidates=candidates,
+            )
+
+        self.assertEqual(mock_client.chat.completions.create.call_count, 2)
+        self.assertEqual(len(result), 5)
 
     async def test_scoring_mode_deduplicates_repeated_index(self):
         """Production logs showed a local LLM emitting the same index twice in

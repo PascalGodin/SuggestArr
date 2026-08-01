@@ -15,7 +15,7 @@ import asyncio
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
@@ -53,6 +53,17 @@ def _preference_signal_label(item: Dict) -> Optional[str]:
     if signal in {"negative", "disliked"}:
         return "negative signal"
     return "recent/neutral watch"
+
+
+# Scoring-mode responses covering fewer than this fraction of sent candidates
+# are rejected and retried rather than silently accepted. Seen in production:
+# a local LLM corrupted its own JSON mid-generation such that everything past
+# candidate 6 (of 25) ended up as literal text inside candidate 6's "reason"
+# string instead of separate array entries — that still passes ordinary
+# schema validation (a string field can hold anything), so nothing caught
+# 19 of 25 candidates silently never being scored. Set below 1.0 to tolerate
+# an occasional missed index or two rather than retrying over a minor gap.
+MIN_SCORE_COMPLETENESS_RATIO = 0.6
 
 
 def _tag_metadata_bracket(item: Dict) -> str:
@@ -458,6 +469,13 @@ def _is_duplicate_of_history(rec_title: str, watched_titles: set) -> bool:
 # Core validation / retry engine
 # ---------------------------------------------------------------------------
 
+class _SemanticValidationError(Exception):
+    """Raised by an ``extra_validate`` callback to reject an otherwise
+    schema-valid response — e.g. a scoring response that structurally
+    validates but silently covers far fewer candidates than it was asked to.
+    Handled identically to a schema/JSON failure by _call_with_validation."""
+
+
 async def _call_with_validation(
     client: AsyncOpenAI,
     model: str,
@@ -466,6 +484,7 @@ async def _call_with_validation(
     temperature: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     max_retries: int = 2,
+    extra_validate: Optional[Callable[[_T], Optional[str]]] = None,
 ) -> _T:
     """Call the LLM and validate the response against *schema_cls*, with retries.
 
@@ -492,6 +511,13 @@ async def _call_with_validation(
     :param temperature: Optional sampling temperature. ``None`` omits it.
     :param reasoning_effort: Optional provider/model-supported reasoning effort.
     :param max_retries: Number of *additional* attempts after the first failure.
+    :param extra_validate: Optional callback run on the schema-validated model;
+        return a problem-description string to reject the response (retried
+        like any other validation failure), or None to accept it. Covers
+        semantic issues Pydantic can't catch — e.g. a local LLM corrupting
+        its own JSON mid-generation such that most of an array's intended
+        entries end up as literal text inside one earlier entry's string
+        field, which still passes ordinary schema validation.
     :raises LLMValidationError: When all attempts are exhausted.
     :return: Validated Pydantic model instance.
     """
@@ -540,8 +566,12 @@ async def _call_with_validation(
             parsed = json.loads(content)
             parsed = _normalize_parsed_response(parsed, schema_cls)
             validated = schema_cls.model_validate(parsed)
+            if extra_validate is not None:
+                problem = extra_validate(validated)
+                if problem:
+                    raise _SemanticValidationError(problem)
             return validated
-        except (json.JSONDecodeError, ValidationError) as exc:
+        except (json.JSONDecodeError, ValidationError, _SemanticValidationError) as exc:
             last_error = exc
             preview = content.replace("\n", "\\n")[:200]
             logger.warning(
@@ -553,9 +583,14 @@ async def _call_with_validation(
                 preview,
             )
             if attempt < max_retries:
-                # Inject correction hint as the first system message and retry.
+                # A semantic-validation problem gets its own specific
+                # corrective message; schema/JSON failures get the generic hint.
+                retry_hint = (
+                    str(exc) if isinstance(exc, _SemanticValidationError)
+                    else _validation_retry_message(schema_cls)
+                )
                 current_messages = [
-                    {"role": "system", "content": _validation_retry_message(schema_cls)},
+                    {"role": "system", "content": retry_hint},
                     *messages,
                 ]
 
@@ -752,6 +787,18 @@ async def get_recommendations_from_history(
                 model, len(history_items), list_type, len(candidates),
             )
 
+            def _check_scoring_completeness(scored: CandidateScoringResponse) -> Optional[str]:
+                min_expected = len(candidates) * MIN_SCORE_COMPLETENESS_RATIO
+                if len(scored.scores) < min_expected:
+                    return (
+                        f"Your response only scored {len(scored.scores)} of the "
+                        f"{len(candidates)} candidates listed. Score EVERY candidate: "
+                        f"one JSON object per candidate in the \"scores\" array. Do not "
+                        f"embed additional candidates' scores as text inside another "
+                        f"candidate's \"reason\" string, and do not stop early."
+                    )
+                return None
+
             try:
                 scored: CandidateScoringResponse = await _call_with_validation(
                     client=client,
@@ -760,6 +807,7 @@ async def get_recommendations_from_history(
                     schema_cls=CandidateScoringResponse,
                     temperature=0.7,
                     max_retries=max_retries,
+                    extra_validate=_check_scoring_completeness,
                 )
             except LLMValidationError as exc:
                 logger.error(
