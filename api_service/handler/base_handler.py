@@ -275,11 +275,14 @@ class BaseMediaHandler(ABC):
         and vote-count thresholds, include_no_ratings, language, release year,
         genre include/exclude) are applied to the whole pool before ranking, so
         candidates the job would never allow don't occupy slots that a genuinely
-        matching candidate could have used. Candidates are then ranked by genre
-        affinity with the user's watch history first, rating second, and capped
-        at LLM_MAX_CANDIDATES (env var, default 25) — this keeps the cap from
-        being dominated by high-rated but off-theme items (e.g. a niche
-        high-rated title in a genre the user never watches). Finally, the
+        matching candidate could have used. "Recommended" (similar-to-history)
+        and "popular" (broad discover) candidates are then ranked together on
+        equal footing by genre affinity with the user's watch history first,
+        rating second, and capped at LLM_MAX_CANDIDATES (env var, default 25)
+        — this keeps the cap from being dominated by high-rated but off-theme
+        items (e.g. a niche high-rated title in a genre the user never
+        watches), and from a "popular" item losing out to a weaker
+        "recommended" one purely because of where it came from. Finally, the
         capped list is checked against excluded streaming services (a no-op
         network-wise when that filter isn't configured).
 
@@ -434,29 +437,25 @@ class BaseMediaHandler(ABC):
         def _rating(c):
             return float(c.get('rating') or c.get('vote_average') or 0)
 
-        recommended_filtered = sorted(
-            [c for c in candidates
-             if c.get('_candidate_source') == 'recommended'
-             and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
-             and str(c.get('id', '')) not in library_ids
-             and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
-            key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True,
-        )
-        popular_filtered = sorted(
-            [c for c in candidates
-             if c.get('_candidate_source') == 'popular'
-             and _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
-             and str(c.get('id', '')) not in library_ids
-             and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)],
-            key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True,
-        )
-        filtered = recommended_filtered + popular_filtered
+        # Rank "recommended" (similar-to-history) and "popular" (broad discover)
+        # candidates on equal footing — genre affinity is the real signal we
+        # care about, and a popular item that matches taste just as well as a
+        # "recommended" one has no principled reason to be pushed to the back
+        # just because of which TMDb endpoint it came from.
+        eligible = [
+            c for c in candidates
+            if _norm(c.get('title') or c.get('name') or '') not in history_titles_norm
+            and str(c.get('id', '')) not in library_ids
+            and not (self.honor_seer_discovery and str(c.get('id', '')) in self.seer_discovered_ids)
+        ]
+        filtered = sorted(eligible, key=lambda c: (_genre_affinity(c), _rating(c)), reverse=True)
 
+        recommended_count = sum(1 for c in filtered if c.get('_candidate_source') == 'recommended')
         self.logger.info(
             "Candidate pool: %d items (%d recommended + %d popular, before cap)",
             len(filtered),
-            len(recommended_filtered),
-            len(popular_filtered),
+            recommended_count,
+            len(filtered) - recommended_count,
         )
         config = ConfigService.get_runtime_config()
         max_candidates = int(config.get("LLM_MAX_CANDIDATES", self._DEFAULT_MAX_CANDIDATES))
