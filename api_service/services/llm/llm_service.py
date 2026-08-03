@@ -858,7 +858,7 @@ async def get_recommendations_from_history(
                     model=model,
                     messages=messages,
                     schema_cls=CandidateScoringResponse,
-                    temperature=0.7,
+                    **generation_settings,
                     max_retries=max_retries,
                     extra_validate=_check_scoring_completeness,
                 )
@@ -970,7 +970,7 @@ async def get_recommendations_from_history(
                     model=model,
                     messages=gen_messages,
                     schema_cls=RecommendationList,
-                    temperature=0.7,
+                    **generation_settings,
                     max_retries=max_retries,
                 )
             except LLMValidationError as exc:
