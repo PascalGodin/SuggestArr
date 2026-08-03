@@ -745,7 +745,7 @@ async def get_recommendations_from_history(
 
             prompt = f"""
         You are an expert film and television recommendation system.
-        The user has recently watched and enjoyed the following {list_type}:
+        The user has recently watched the following {list_type}:
 
         {history_text}
         {constraints_block}
