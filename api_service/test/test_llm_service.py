@@ -711,6 +711,31 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
         prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("Current web-search context: result", prompt)
 
+    async def test_scoring_mode_never_fetches_web_context(self):
+        """Scoring mode's prompt has no {web_context} placeholder — fetching it
+        there would just be a wasted SearXNG round-trip on every real
+        recommendation call (the actual production path, since base_handler.py
+        always builds a candidate pool), silently discarded either way."""
+        candidates = [{"_candidate_source": "recommended", "id": 1, "title": "Dune", "genre_ids": []}]
+        scoring_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "fits"}],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(scoring_payload)
+        )
+        web_context_mock = AsyncMock(return_value="\nCurrent web-search context: result\n")
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config",
+                   return_value={**_DEFAULT_CONFIG, "SEARXNG_BASE_URL": "http://searxng:8080"}), \
+             patch("api_service.services.llm.llm_service._get_web_search_context", new=web_context_mock):
+            await get_recommendations_from_history(
+                [{"title": "Interstellar", "year": 2014}], max_results=1,
+                item_type="movie", candidates=candidates,
+            )
+        web_context_mock.assert_not_called()
+
     async def test_watched_history_line_includes_same_metadata_as_candidates(self):
         """The watched-history list previously showed only bare title/year,
         while candidates got rating/genre/keyword/director — this asymmetry
