@@ -116,45 +116,67 @@ class JellyfinClient(BaseHTTPClient):
             self.logger.error(f"Library item is missing 'id': {library}")
             return
 
-        params = {
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Series",
-            "Fields": "ProviderIds",
-            "ParentID": library_id
-        }
-
-        self.logger.debug(f"Requesting items for library {library_name} with params: {params}")
+        page_size = 500
+        start_index = 0
+        total_record_count = None
+        fetched = 0
+        added = 0
+        skipped_no_tmdb_id = 0
 
         try:
-            async with session.get(
-                f"{self.api_url}/Items",
-                headers=self.headers,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=LIBRARY_FETCH_TIMEOUT)
-            ) as response:
-                if response.status != 200:
-                    self.logger.error("Failed to get items for library %s: %d", library_name, response.status)
-                    return
+            while True:
+                params = {
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Movie,Series",
+                    "Fields": "ProviderIds",
+                    "ParentID": library_id,
+                    "StartIndex": start_index,
+                    "Limit": page_size,
+                }
 
-                data = await response.json()
-                items = data.get("Items", [])
+                self.logger.debug(f"Requesting items for library {library_name} with params: {params}")
 
-                added = 0
-                for item in items:
-                    item_type = item.get("Type")
-                    if item_type not in ("Movie", "Series"):
-                        continue
+                async with session.get(
+                    f"{self.api_url}/Items",
+                    headers=self.headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=LIBRARY_FETCH_TIMEOUT)
+                ) as response:
+                    if response.status != 200:
+                        self.logger.error("Failed to get items for library %s: %d", library_name, response.status)
+                        return
 
-                    tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
-                    if not tmdb_id:
-                        continue
+                    data = await response.json()
+                    items = data.get("Items", [])
+                    total_record_count = data.get("TotalRecordCount", total_record_count)
+                    fetched += len(items)
 
-                    item["tmdb_id"] = tmdb_id
-                    bucket = "tv" if item_type == "Series" else "movie"
-                    results_by_library[bucket].append(item)
-                    added += 1
+                    for item in items:
+                        item_type = item.get("Type")
+                        if item_type not in ("Movie", "Series"):
+                            continue
 
-                self.logger.info("Retrieved %d valid items in %s", added, library_name)
+                        tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
+                        if not tmdb_id:
+                            skipped_no_tmdb_id += 1
+                            continue
+
+                        item["tmdb_id"] = tmdb_id
+                        bucket = "tv" if item_type == "Series" else "movie"
+                        results_by_library[bucket].append(item)
+                        added += 1
+
+                # A short page (fewer items than requested) is the reliable signal
+                # that we've reached the end — don't gate on TotalRecordCount alone,
+                # since it's only used for logging and isn't guaranteed present.
+                if len(items) < page_size:
+                    break
+                start_index += page_size
+
+            self.logger.info(
+                "Retrieved %d valid items in %s (%d fetched, %d skipped for missing TMDb ID, server total %s)",
+                added, library_name, fetched, skipped_no_tmdb_id, total_record_count,
+            )
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self.logger.error("Error retrieving items for library %s: %s", library_name, str(e))

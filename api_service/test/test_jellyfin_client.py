@@ -225,6 +225,47 @@ class TestGetAllLibraryItems(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result['movie']), 1)
         self.assertEqual(len(result['tv']), 0)
 
+    async def test_paginates_past_the_first_page(self):
+        """A full first page (== page_size) must trigger a second request; a
+        short page signals the end. Regression test for a Jellyfin 12 library
+        scan silently truncating at an implicit page cap."""
+        page_size = 500
+        first_page = {
+            'Items': [
+                {'Type': 'Movie', 'ProviderIds': {'Tmdb': str(i)}, 'Name': f'Movie {i}'}
+                for i in range(page_size)
+            ],
+            'TotalRecordCount': page_size + 1,
+        }
+        second_page = {
+            'Items': [
+                {'Type': 'Movie', 'ProviderIds': {'Tmdb': 'last'}, 'Name': 'Last Movie'},
+            ],
+            'TotalRecordCount': page_size + 1,
+        }
+        self.client.libraries = [{'id': 'lib1', 'name': 'Movies'}]
+
+        responses = iter([
+            _mock_response(200, first_page),
+            _mock_response(200, second_page),
+        ])
+        calls = []
+
+        def get_side_effect(*args, **kwargs):
+            calls.append(kwargs.get('params'))
+            return next(responses)
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=get_side_effect)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_all_library_items()
+
+        self.assertEqual(len(result['movie']), page_size + 1)
+        self.assertEqual(result['movie'][-1]['tmdb_id'], 'last')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['StartIndex'], 0)
+        self.assertEqual(calls[1]['StartIndex'], page_size)
+
     async def test_auto_fetches_libraries_when_not_configured(self):
         """When libraries=None the client should call get_libraries() first."""
         raw_libs = [
