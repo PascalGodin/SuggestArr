@@ -121,30 +121,6 @@ class TestGetLibraries(unittest.IsolatedAsyncioTestCase):
             result = await self.client.get_libraries()
         self.assertIsNone(result)
 
-    async def get_libraries(self):
-        session = await self._get_session()
-        url = f"{self.api_url}/Library/VirtualFolders"
-    
-        # First attempt: legacy Jellyfin auth
-        headers = {
-            "X-Emby-Token": self.api_token
-        }
-    
-        response = await session.get(url, headers=headers)
-    
-        if response.status == 401:
-            # Retry with MediaBrowser Authorization header
-            headers = {
-                "Authorization": f'MediaBrowser Token="{self.api_token}"'
-            }
-            response = await session.get(url, headers=headers)
-    
-        if response.status != 200:
-            text = await response.text()
-            raise Exception(f"Failed to get libraries: {response.status} - {text}")
-    
-        return await response.json()
-
     async def test_retries_all_methods_and_succeeds_with_api_key_query_param(self):
         payload = [{'ItemId': 'lib2', 'Name': 'TV'}]
         responses = [
@@ -164,7 +140,7 @@ class TestGetLibraries(unittest.IsolatedAsyncioTestCase):
 
         third_call = session.get.call_args_list[2]
         self.assertIsNone(third_call.kwargs.get('headers'))
-        self.assertEqual(third_call.kwargs.get('params'), {'api_key': 'fake_token'})
+        self.assertEqual(third_call.kwargs.get('params'), {'ApiKey': 'fake_token'})
 
     async def test_returns_none_when_all_auth_methods_fail_after_401(self):
         # VirtualFolders and MediaFolders fallback each try 3 auth methods.

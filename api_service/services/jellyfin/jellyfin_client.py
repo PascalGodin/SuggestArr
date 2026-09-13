@@ -34,8 +34,15 @@ class JellyfinClient(BaseHTTPClient):
         # Strip whitespace from token to avoid 401s from copy-paste artefacts.
         self.api_token = token.strip() if token else token
         self.headers = {
+            # X-Emby-Token is ignored by Jellyfin 12+ (EnableLegacyAuthorization defaults
+            # to false), so the standard Authorization header — with the full MediaBrowser
+            # field set, not just Token= — is the one that actually authenticates there.
+            # Kept for Emby and pre-12 Jellyfin, which still honor it.
             "X-Emby-Token": self.api_token,
-            "Authorization": f'MediaBrowser Token="{self.api_token}"'
+            "Authorization": (
+                f'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
+                f'DeviceId="suggestarr", Version="1.0.0", Token="{self.api_token}"'
+            ),
         }
         self.existing_content = {}
         self._series_provider_ids_cache = {}
@@ -371,22 +378,28 @@ class JellyfinClient(BaseHTTPClient):
 
         auth_attempts = [
             {
-                "name": "X-Emby-Token header",
+                # Jellyfin 12+ requires the full MediaBrowser field set on the standard
+                # Authorization header — Token= alone or the legacy X-Emby-Token header
+                # is silently ignored once EnableLegacyAuthorization defaults to false.
+                "name": "MediaBrowser Authorization header",
                 "headers": {
-                    "X-Emby-Token": self.api_token,
-                    "Authorization": f'MediaBrowser Token="{self.api_token}"'
+                    "Authorization": (
+                        f'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
+                        f'DeviceId="suggestarr", Version="1.0.0", Token="{self.api_token}"'
+                    )
                 },
                 "params": None,
             },
             {
-                "name": "MediaBrowser Authorization header",
-                "headers": {"Authorization": f'MediaBrowser Token="{self.api_token}"'},
+                "name": "X-Emby-Token header",
+                "headers": {"X-Emby-Token": self.api_token},
                 "params": None,
             },
             {
-                "name": "api_key query parameter",
+                # Jellyfin's query-param key is "ApiKey", not "api_key".
+                "name": "ApiKey query parameter",
                 "headers": None,
-                "params": {"api_key": self.api_token},
+                "params": {"ApiKey": self.api_token},
             },
         ]
 
