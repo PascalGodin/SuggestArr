@@ -7,6 +7,7 @@ on:
 
 jobs:
   bump-version:
+    if: github.repository == 'giuseppe99barchetta/SuggestArr'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -79,6 +80,7 @@ jobs:
           git push origin "${{ steps.bump_version.outputs.new_version }}"
 
   build:
+    if: github.repository == 'giuseppe99barchetta/SuggestArr'
     permissions:
       contents: read
       packages: write
@@ -139,6 +141,7 @@ jobs:
             DOCKER_TAG=${{ needs.bump-version.outputs.new_version }}
 
   merge:
+    if: github.repository == 'giuseppe99barchetta/SuggestArr'
     permissions:
       contents: read
       packages: write
@@ -192,6 +195,7 @@ jobs:
           done
 
   recreate-nightly:
+    if: github.repository == 'giuseppe99barchetta/SuggestArr'
     permissions:
       contents: write
     needs: merge
