@@ -400,6 +400,12 @@ class BaseMediaHandler(ABC):
             if h.get('title') or h.get('name')
         }
 
+        # Each seed makes 2-3 TMDb calls (search, taste metadata, similar items).
+        # With up to max_content history seeds processed concurrently below, an
+        # unbounded fan-out easily bursts well past TMDb's rate limit — bound it
+        # the same way _enrich() bounds candidate enrichment further down.
+        seed_semaphore = asyncio.Semaphore(self._TASTE_METADATA_CONCURRENCY)
+
         async def _get_similar(item):
             """Return (seed_tags, similar_items) for one watched item."""
             title = item.get('title') or item.get('name') or ''
@@ -407,22 +413,23 @@ class BaseMediaHandler(ABC):
             if not title:
                 return [], []
             try:
-                results = await search_fn(title, year)
-                if not results:
-                    self.logger.info("Candidate pool seed: '%s' (%s) — no TMDb search match", title, year)
-                    return [], []
-                matched = results[0]
-                tmdb_id = matched.get('id')
-                if not tmdb_id:
-                    return [], []
-                self.logger.info(
-                    "Candidate pool seed: '%s' (%s) -> TMDb '%s' (id=%s, genre_ids=%s)",
-                    title, year, matched.get('title') or matched.get('name'), tmdb_id, matched.get('genre_ids', []),
-                )
-                taste, similar = await asyncio.gather(
-                    tc.get_taste_metadata(tmdb_id, item_type),
-                    similar_fn(tmdb_id),
-                )
+                async with seed_semaphore:
+                    results = await search_fn(title, year)
+                    if not results:
+                        self.logger.info("Candidate pool seed: '%s' (%s) — no TMDb search match", title, year)
+                        return [], []
+                    matched = results[0]
+                    tmdb_id = matched.get('id')
+                    if not tmdb_id:
+                        return [], []
+                    self.logger.info(
+                        "Candidate pool seed: '%s' (%s) -> TMDb '%s' (id=%s, genre_ids=%s)",
+                        title, year, matched.get('title') or matched.get('name'), tmdb_id, matched.get('genre_ids', []),
+                    )
+                    taste, similar = await asyncio.gather(
+                        tc.get_taste_metadata(tmdb_id, item_type),
+                        similar_fn(tmdb_id),
+                    )
                 seed_tags = _tags_for({
                     'genre_ids': matched.get('genre_ids', []),
                     'keyword_ids': taste.get('keyword_ids', []),
