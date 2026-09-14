@@ -55,6 +55,16 @@ export const jobsApi = {
   },
 
   /**
+   * Duplicate a job.
+   * @param {number} jobId - Job ID to duplicate.
+   * @returns {Promise<Object>} Response with the new job object.
+   */
+  async duplicateJob(jobId) {
+    const response = await axios.post(`/api/jobs/${jobId}/duplicate`);
+    return response.data;
+  },
+
+  /**
    * Toggle job enabled status.
    * @param {number} jobId - Job ID.
    * @returns {Promise<Object>} Response with new enabled status.

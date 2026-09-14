@@ -48,7 +48,7 @@ from api_service.services.llm.llm_service import (
     get_recommendations_from_history,
     interpret_search_query,
 )
-from api_service.services.llm.schemas import RecommendationList, SearchQueryInterpretation
+from api_service.services.llm.schemas import CandidateScoringResponse, RecommendationList, SearchQueryInterpretation
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +339,66 @@ class TestCallWithValidation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.recommendations[0].title, "Se7en")
         # Two calls: first failure + one retry
         self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    async def test_extra_validate_rejects_incomplete_response_and_retries(self):
+        """Reproduces the production bug: a response that structurally passes
+        schema validation (every field is the right type) but is semantically
+        incomplete — here, only 1 of 3 candidates scored, as happens when a
+        local LLM corrupts its own JSON mid-generation and the rest of the
+        array ends up as literal text inside one entry's 'reason' string."""
+        incomplete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "ok, rest got swallowed as text"}],
+        })
+        complete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [
+                {"index": 1, "score": 80, "reason": "ok"},
+                {"index": 2, "score": 50, "reason": "ok"},
+                {"index": 3, "score": 30, "reason": "ok"},
+            ],
+        })
+        client = self._make_client(
+            _mock_openai_response(incomplete_payload),
+            _mock_openai_response(complete_payload),
+        )
+
+        def extra_validate(scored):
+            if len(scored.scores) < 3 * 0.6:
+                return "incomplete"
+            return None
+
+        result = await _call_with_validation(
+            client=client,
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "score"}],
+            schema_cls=CandidateScoringResponse,
+            max_retries=2,
+            extra_validate=extra_validate,
+        )
+
+        self.assertEqual(len(result.scores), 3)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+
+    async def test_extra_validate_exhausts_retries_and_raises(self):
+        payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "ok"}],
+        })
+        client = self._make_client(
+            _mock_openai_response(payload),
+            _mock_openai_response(payload),
+        )
+
+        with self.assertRaises(LLMValidationError):
+            await _call_with_validation(
+                client=client,
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "score"}],
+                schema_cls=CandidateScoringResponse,
+                max_retries=1,
+                extra_validate=lambda scored: "always incomplete",
+            )
 
     async def test_retry_injects_corrective_system_message(self):
         bad_payload = json.dumps({"wrong_key": []})
@@ -650,6 +710,202 @@ class TestGetRecommendationsFromHistory(unittest.IsolatedAsyncioTestCase):
             await get_recommendations_from_history([{"title": "Inception", "year": 2010}], max_results=1)
         prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("Current web-search context: result", prompt)
+
+    async def test_scoring_mode_never_fetches_web_context(self):
+        """Scoring mode's prompt has no {web_context} placeholder — fetching it
+        there would just be a wasted SearXNG round-trip on every real
+        recommendation call (the actual production path, since base_handler.py
+        always builds a candidate pool), silently discarded either way."""
+        candidates = [{"_candidate_source": "recommended", "id": 1, "title": "Dune", "genre_ids": []}]
+        scoring_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": 1, "score": 80, "reason": "fits"}],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(scoring_payload)
+        )
+        web_context_mock = AsyncMock(return_value="\nCurrent web-search context: result\n")
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config",
+                   return_value={**_DEFAULT_CONFIG, "SEARXNG_BASE_URL": "http://searxng:8080"}), \
+             patch("api_service.services.llm.llm_service._get_web_search_context", new=web_context_mock):
+            await get_recommendations_from_history(
+                [{"title": "Interstellar", "year": 2014}], max_results=1,
+                item_type="movie", candidates=candidates,
+            )
+        web_context_mock.assert_not_called()
+
+    async def test_watched_history_line_includes_same_metadata_as_candidates(self):
+        """The watched-history list previously showed only bare title/year,
+        while candidates got rating/genre/keyword/director — this asymmetry
+        meant the LLM had far less to reason from about what the user
+        actually likes than about what it's picking from. base_handler.py
+        now resolves and attaches this metadata onto history items too
+        (reusing data already fetched for the TF-IDF ranking), so it must
+        render here the same way it does for candidates."""
+        recs = [{"title": "Interstellar", "year": 2014, "source_title": "Inception", "rationale": "ok"}]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(_wrap_recs(recs))
+        )
+        history = [{
+            "title": "Inception",
+            "year": 2010,
+            "rating": 8.8,
+            "genre_names": ["Science Fiction", "Action"],
+            "keyword_names": ["dream", "heist"],
+            "director": "Christopher Nolan",
+        }]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(history, max_results=3, item_type="movie")
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("Science Fiction", user_prompt)
+        self.assertIn("dream", user_prompt)
+        self.assertIn("Christopher Nolan", user_prompt)
+
+    async def test_scoring_mode_retries_when_response_covers_too_few_candidates(self):
+        """End-to-end version of the production incident: 25 candidates sent,
+        but the LLM's JSON corrupts mid-generation so only a handful actually
+        get scored (the rest end up as literal text inside one candidate's
+        'reason' field — still schema-valid, since 'reason' is just a string).
+        get_recommendations_from_history must reject that response and retry
+        rather than silently proceeding with a mostly-unscored candidate pool."""
+        candidates = [
+            {"_candidate_source": "recommended", "id": i, "title": f"Show {i}", "genre_ids": []}
+            for i in range(1, 11)  # 10 candidates
+        ]
+        # Only 2 of 10 scored — well under the 60% completeness floor.
+        incomplete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [
+                {"index": 1, "score": 80, "reason": "ok"},
+                {"index": 2, "score": 70, "reason": "ok"},
+            ],
+        })
+        complete_payload = json.dumps({
+            "taste_profile": "sci-fi",
+            "scores": [{"index": i, "score": 100 - i, "reason": "ok"} for i in range(1, 11)],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=[
+            _mock_openai_response(incomplete_payload),
+            _mock_openai_response(complete_payload),
+        ])
+        history = [{"title": "Avatar", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            result = await get_recommendations_from_history(
+                history, max_results=5, item_type="tv", candidates=candidates,
+            )
+
+        self.assertEqual(mock_client.chat.completions.create.call_count, 2)
+        self.assertEqual(len(result), 5)
+
+    async def test_scoring_mode_deduplicates_repeated_index(self):
+        """Production logs showed a local LLM emitting the same index twice in
+        the 'scores' array with two different scores. Without dedup, both
+        occurrences of the higher-scoring duplicate could fill valid_recommendations
+        before a genuinely different candidate is ever considered."""
+        candidates = [
+            {"_candidate_source": "recommended", "id": 1, "title": "Percy Jackson", "genre_ids": []},
+            {"_candidate_source": "recommended", "id": 2, "title": "Merlin", "genre_ids": []},
+        ]
+        # index 1 appears twice (scores 90 and 95) — the duplicate must not
+        # consume the slot that index 2 should get.
+        scoring_payload = json.dumps({
+            "taste_profile": "high-fantasy adventure",
+            "scores": [
+                {"index": 1, "score": 90, "reason": "first occurrence"},
+                {"index": 1, "score": 95, "reason": "duplicate occurrence"},
+                {"index": 2, "score": 50, "reason": "Merlin fits the fantasy theme"},
+            ],
+        })
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(scoring_payload)
+        )
+        history = [{"title": "Avatar: The Last Airbender", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            result = await get_recommendations_from_history(
+                history, max_results=2, item_type="tv", candidates=candidates,
+            )
+
+        titles = [r["title"] for r in result]
+        self.assertEqual(titles, ["Percy Jackson", "Merlin"])
+
+    async def test_scoring_mode_prompt_preserves_candidate_pool_rank_order(self):
+        """Candidates arrive from _build_candidate_pool already ranked by genre
+        affinity, interleaving 'recommended' and 'popular' sources. The prompt
+        must present them in that same order — re-partitioning into a
+        recommended-first, popular-last block would re-impose a source-based
+        ordering the pool-building step deliberately removed."""
+        candidates = [
+            {"_candidate_source": "popular", "id": 1, "title": "Game of Thrones", "genre_ids": []},
+            {"_candidate_source": "recommended", "id": 2, "title": "Percy Jackson", "genre_ids": []},
+            {"_candidate_source": "popular", "id": 3, "title": "Neighbours", "genre_ids": []},
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(json.dumps({
+                "taste_profile": "fantasy adventure",
+                "scores": [
+                    {"index": 1, "score": 50, "reason": "ok"},
+                    {"index": 2, "score": 50, "reason": "ok"},
+                    {"index": 3, "score": 50, "reason": "ok"},
+                ],
+            }))
+        )
+        history = [{"title": "Avatar: The Last Airbender", "year": 2026}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(
+                history, max_results=3, item_type="tv", candidates=candidates,
+            )
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertLess(
+            user_prompt.index("Game of Thrones"), user_prompt.index("Percy Jackson"),
+            "A popular candidate ranked ahead of a recommended one must appear "
+            "first in the prompt, not be pushed after all recommended items.",
+        )
+        self.assertLess(
+            user_prompt.index("Percy Jackson"), user_prompt.index("Neighbours"),
+        )
+
+    async def test_scoring_mode_prompt_includes_keywords_and_director(self):
+        """Keywords and director are fetched to feed the TF-IDF ranking, but
+        should also render in the prompt line so the LLM's own reasoning has
+        something more specific than genre tags to point at."""
+        candidates = [{
+            "_candidate_source": "recommended",
+            "id": 1,
+            "title": "Interstellar",
+            "genre_ids": [],
+            "keyword_names": ["time travel", "black hole", "father-daughter relationship"],
+            "director": "Christopher Nolan",
+        }]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_openai_response(json.dumps({
+                "taste_profile": "sci-fi",
+                "scores": [{"index": 1, "score": 80, "reason": "ok"}],
+            }))
+        )
+        history = [{"title": "Inception", "year": 2010}]
+        with patch("api_service.services.llm.llm_service.get_llm_client", return_value=mock_client), \
+             patch("api_service.services.llm.llm_service.ConfigService.get_runtime_config", return_value=_DEFAULT_CONFIG):
+            await get_recommendations_from_history(
+                history, max_results=1, item_type="movie", candidates=candidates,
+            )
+
+        user_prompt = mock_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("time travel", user_prompt)
+        self.assertIn("black hole", user_prompt)
+        self.assertIn("Christopher Nolan", user_prompt)
 
 
 # ---------------------------------------------------------------------------

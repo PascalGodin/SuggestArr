@@ -809,18 +809,84 @@ class TMDbClient(BaseHTTPClient):
     async def search_tv(self, title, year=None):
         """
         Search for a TV show by name and optionally first air year.
+
+        The caller's `year` is typically the air year of whatever episode/season
+        was watched, not necessarily the show's original first-air year — for a
+        returning show those differ (e.g. a season watched in 2026 of a show that
+        first aired in 2022). TMDb's `first_air_date_year` filters strictly on the
+        latter, so a year-filtered search can wrongly return nothing for a show
+        that's very much on TMDb. When that happens, retry without the year filter
+        before giving up.
+
         :param title: TV show name.
         :param year: First air year (optional).
         :return: List of formatted search results or empty list.
         """
         import urllib.parse
         encoded_title = urllib.parse.quote(str(title))
-        url = f"{self.tmdb_api_url}/search/tv?api_key={self.api_key}&query={encoded_title}"
-        if year:
-            url += f"&first_air_date_year={year}"
-            
+        base_url = f"{self.tmdb_api_url}/search/tv?api_key={self.api_key}&query={encoded_title}"
+        url = f"{base_url}&first_air_date_year={year}" if year else base_url
+
         self.logger.debug("Searching TMDb for TV show: %s (Year: %s)", title, year)
-        return await self._execute_search(url, 'tv')
+        results = await self._execute_search(url, 'tv')
+
+        if not results and year:
+            self.logger.debug(
+                "No TMDb match for '%s' with first_air_date_year=%s — retrying without year filter",
+                title, year,
+            )
+            results = await self._execute_search(base_url, 'tv')
+
+        return results
+
+    async def get_taste_metadata(self, content_id, content_type):
+        """
+        Fetch TMDb keywords and director for a movie or TV show in one request.
+
+        Uses append_to_response=keywords,credits so both come back alongside
+        the details call rather than two separate round trips. TMDb nests
+        keywords differently per media type: movies under "keywords", TV
+        shows under "results".
+
+        :param content_id: TMDb ID.
+        :param content_type: 'movie' or 'tv'.
+        :return: dict with 'keyword_ids' (list[int]), 'keyword_names'
+            (list[str]), and 'director' (str|None). Empty/None on any failure.
+        """
+        empty = {'keyword_ids': [], 'keyword_names': [], 'director': None}
+        url = (
+            f"{self.tmdb_api_url}/{content_type}/{content_id}"
+            f"?api_key={self.api_key}&append_to_response=keywords,credits"
+        )
+        try:
+            session = await self._get_session()
+            async with session.get(url, timeout=self.REQUEST_TIMEOUT) as response:
+                if response.status not in HTTP_OK:
+                    self.logger.debug(
+                        "Failed to fetch taste metadata for %s ID %s: HTTP %d",
+                        content_type, content_id, response.status,
+                    )
+                    return empty
+                data = await response.json()
+        except aiohttp.ClientError as e:
+            self.logger.debug(
+                "Error fetching taste metadata for %s ID %s: %s",
+                content_type, content_id, str(e).replace(self.api_key, "***"),
+            )
+            return empty
+
+        keywords_block = data.get('keywords') or {}
+        raw_keywords = keywords_block.get('keywords' if content_type == 'movie' else 'results') or []
+        keyword_ids = [k.get('id') for k in raw_keywords if k.get('id') is not None]
+        keyword_names = [k.get('name') for k in raw_keywords if k.get('name')]
+
+        director = None
+        for member in (data.get('credits') or {}).get('crew') or []:
+            if member.get('job') == 'Director':
+                director = member.get('name')
+                break
+
+        return {'keyword_ids': keyword_ids, 'keyword_names': keyword_names, 'director': director}
 
     async def _execute_search(self, url, content_type):
         """Helper to execute search and format results."""

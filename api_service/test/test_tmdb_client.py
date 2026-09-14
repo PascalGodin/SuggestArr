@@ -626,6 +626,104 @@ class TestSearchMovieAndTv(unittest.IsolatedAsyncioTestCase):
             result = await self.client.search_tv('Breaking Bad')
         self.assertEqual(result, [])
 
+    async def test_search_tv_retries_without_year_when_year_filtered_search_is_empty(self):
+        """A returning show's most-recently-watched season year can differ from
+        its TMDb first_air_date_year (e.g. Jellyfin reports the season's air
+        year, not the show's premiere year). The year-filtered search must not
+        be the final word — a year-less retry should still find the show."""
+        empty_resp = _mock_response(200, {'results': []})
+        found_resp = _mock_response(200, {'results': [_TV_ITEM]})
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[empty_resp, found_resp])
+
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.search_tv('Breaking Bad', year=2026)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['id'], 202)
+        self.assertEqual(session.get.call_count, 2)
+        first_url = session.get.call_args_list[0].args[0]
+        second_url = session.get.call_args_list[1].args[0]
+        self.assertIn('first_air_date_year=2026', first_url)
+        self.assertNotIn('first_air_date_year', second_url)
+
+    async def test_search_tv_does_not_retry_when_year_filtered_search_succeeds(self):
+        found_resp = _mock_response(200, {'results': [_TV_ITEM]})
+        session = MagicMock()
+        session.get = MagicMock(return_value=found_resp)
+
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.search_tv('Breaking Bad', year=2008)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(session.get.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# get_taste_metadata
+# ---------------------------------------------------------------------------
+
+class TestGetTasteMetadata(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        self.client = _make_client()
+
+    async def test_movie_parses_keywords_and_director(self):
+        payload = {
+            'keywords': {'keywords': [{'id': 818, 'name': 'based on novel or book'}, {'id': 9663, 'name': 'revenge'}]},
+            'credits': {'crew': [
+                {'job': 'Producer', 'name': 'Someone Else'},
+                {'job': 'Director', 'name': 'Christopher Nolan'},
+            ]},
+        }
+        resp = _mock_response(200, payload)
+        session = _mock_session(resp)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_taste_metadata(101, 'movie')
+
+        self.assertEqual(result['keyword_ids'], [818, 9663])
+        self.assertEqual(result['keyword_names'], ['based on novel or book', 'revenge'])
+        self.assertEqual(result['director'], 'Christopher Nolan')
+
+    async def test_tv_keywords_nest_under_results_not_keywords(self):
+        payload = {
+            'keywords': {'results': [{'id': 1, 'name': 'time travel'}]},
+            'credits': {'crew': []},
+        }
+        resp = _mock_response(200, payload)
+        session = _mock_session(resp)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_taste_metadata(202, 'tv')
+
+        self.assertEqual(result['keyword_ids'], [1])
+        self.assertIsNone(result['director'])
+
+    async def test_returns_empty_on_http_error(self):
+        resp = _mock_response(404)
+        session = _mock_session(resp)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_taste_metadata(101, 'movie')
+
+        self.assertEqual(result, {'keyword_ids': [], 'keyword_names': [], 'director': None})
+
+    async def test_returns_empty_on_network_error(self):
+        session = MagicMock()
+        session.get = MagicMock(side_effect=aiohttp.ClientError('timeout'))
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_taste_metadata(101, 'movie')
+
+        self.assertEqual(result, {'keyword_ids': [], 'keyword_names': [], 'director': None})
+
+    async def test_returns_none_director_when_no_director_credited(self):
+        payload = {'keywords': {'keywords': []}, 'credits': {'crew': [{'job': 'Writer', 'name': 'X'}]}}
+        resp = _mock_response(200, payload)
+        session = _mock_session(resp)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_taste_metadata(101, 'movie')
+
+        self.assertIsNone(result['director'])
+
 
 if __name__ == '__main__':
     unittest.main()

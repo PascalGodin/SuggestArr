@@ -15,7 +15,7 @@ import asyncio
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
 from urllib.parse import urlparse
 
 import aiohttp
@@ -27,6 +27,7 @@ from api_service.observability.metrics import integration_error
 from api_service.exceptions.api_exceptions import LLMValidationError
 from api_service.services.config_service import ConfigService
 from api_service.services.llm.schemas import (
+    CandidateScoringResponse,
     DiscoverParams,
     RecommendationList,
     SearchResultRationaleList,
@@ -38,6 +39,95 @@ logger = LoggerManager.get_logger("LLMService")
 
 # Maximum number of unique history items to send to the LLM.
 MAX_HISTORY_ITEMS = 20
+
+def _preference_signal_label(item: Dict) -> Optional[str]:
+    """Return the "strong positive/negative/recent-neutral" watch label.
+
+    Only history items carry ``preference_signal`` (set in base_handler.py);
+    candidates never do, so this returns None for them and no label leaks
+    into candidate lines.
+    """
+    signal = str(item.get('preference_signal') or '').lower()
+    if not signal:
+        return None
+    if signal in {"positive", "strong_positive", "favorite", "liked"}:
+        return "strong positive signal"
+    if signal in {"negative", "disliked"}:
+        return "negative signal"
+    return "recent/neutral watch"
+
+
+# Scoring-mode responses covering fewer than this fraction of sent candidates
+# are rejected and retried rather than silently accepted. Seen in production:
+# a local LLM corrupted its own JSON mid-generation such that everything past
+# candidate 6 (of 25) ended up as literal text inside candidate 6's "reason"
+# string instead of separate array entries — that still passes ordinary
+# schema validation (a string field can hold anything), so nothing caught
+# 19 of 25 candidates silently never being scored. Set below 1.0 to tolerate
+# an occasional missed index or two rather than retrying over a minor gap.
+MIN_SCORE_COMPLETENESS_RATIO = 0.6
+
+
+def _tag_metadata_bracket(item: Dict) -> str:
+    """Build the "[recent/neutral watch; rating: X/10; Genre, Genre; keywords: a, b; dir: Name]"
+    metadata bracket shared by both the candidate list and the watched-history
+    list, so the LLM gets the same grounding for what the user already likes
+    as it does for what it's picking from.
+
+    Genre/keyword names are resolved upstream (base_handler.py, which holds
+    the TMDb client) rather than via a hardcoded ID lookup here — this
+    function only ever displays whatever names it's handed. Falls back to a
+    plain ``genres`` string list when TMDb-resolved ``genre_names`` isn't
+    available (e.g. generation-mode fallback).
+
+    :param item: A TMDb-formatted dict; missing fields are simply omitted.
+    :return: The bracket string (with a leading space), or '' if no metadata
+        is available at all.
+    """
+    rating = item.get('rating') or item.get('vote_average')
+    genre_names = item.get('genre_names') or item.get('genres') or []
+    genre_names = [g for g in genre_names if isinstance(g, str) and g.strip()][:3]
+    keyword_names = (item.get('keyword_names') or [])[:4]
+    director = item.get('director')
+    signal_label = _preference_signal_label(item)
+    meta_parts: List[str] = []
+    if signal_label:
+        meta_parts.append(signal_label)
+    if rating:
+        meta_parts.append(f"rating: {float(rating):.1f}/10")
+    if genre_names:
+        meta_parts.append('genres: ' + ', '.join(genre_names))
+    if keyword_names:
+        meta_parts.append('keywords: ' + ', '.join(keyword_names))
+    if director:
+        meta_parts.append(f"dir: {director}")
+    return f" [{'; '.join(meta_parts)}]" if meta_parts else ''
+
+
+def _fmt_item(item: Dict, index: int, date_field: str) -> str:
+    """Format one prompt line: "{i}. Title (Year) [meta] — overview".
+
+    Shared by the watched-history list and the candidate list so the LLM
+    gets identically-structured grounding for both what the user already
+    likes and what it's picking from — previously the watched-history list
+    only ever showed a bare title/year.
+
+    :param item: A TMDb-formatted dict; missing fields are simply omitted.
+    :param index: 1-based line number.
+    :param date_field: 'release_date' (movie) or 'first_air_date' (TV) —
+        checked before falling back to the item's own 'year' (e.g. a watched
+        item's Jellyfin/Plex-reported year, which isn't a TMDb field).
+    """
+    title = item.get('title') or item.get('name') or 'Unknown'
+    raw_date = item.get(date_field) or item.get('release_date') or item.get('first_air_date') or ''
+    year = raw_date[:4] if raw_date else (item.get('year') or '?')
+    overview = (item.get('overview') or '').strip()
+    if len(overview) > 150:
+        overview = overview[:147] + '...'
+    meta = _tag_metadata_bracket(item)
+    line = f"{index}. {title} ({year}){meta}"
+    return line + f" — {overview}" if overview else line
+
 
 _T = TypeVar("_T", bound=BaseModel)
 
@@ -392,29 +482,6 @@ def _deduplicate_history(history_items: List[Dict]) -> List[Dict]:
     return unique
 
 
-def _format_history_context_item(item: Dict, default_media_type: str) -> str:
-    """Format a compact history item without turning a watch into a like."""
-    title = item.get("title", item.get("name", "Unknown"))
-    year = item.get("year", "Unknown")
-    media_type = item.get("media_type") or item.get("type") or default_media_type
-    signal = str(item.get("preference_signal") or "recent_watch").lower()
-    if signal in {"positive", "strong_positive", "favorite", "liked"}:
-        signal_label = "strong positive signal"
-    elif signal in {"negative", "disliked"}:
-        signal_label = "negative signal"
-    else:
-        signal_label = "recent/neutral watch"
-
-    details = [str(media_type), signal_label]
-    raw_genres = item.get("genres") or []
-    if not isinstance(raw_genres, (list, tuple)):
-        raw_genres = []
-    genres = [genre.strip() for genre in raw_genres if isinstance(genre, str) and genre.strip()]
-    if genres:
-        details.append(f"genres: {', '.join(genres[:4])}")
-    return f"- {title} ({year}) [{'; '.join(details)}]"
-
-
 def _normalize_title(title: str) -> str:
     """Normalize a title for comparison by stripping common decorations.
 
@@ -456,6 +523,13 @@ def _is_duplicate_of_history(rec_title: str, watched_titles: set) -> bool:
 # Core validation / retry engine
 # ---------------------------------------------------------------------------
 
+class _SemanticValidationError(Exception):
+    """Raised by an ``extra_validate`` callback to reject an otherwise
+    schema-valid response — e.g. a scoring response that structurally
+    validates but silently covers far fewer candidates than it was asked to.
+    Handled identically to a schema/JSON failure by _call_with_validation."""
+
+
 async def _call_with_validation(
     client: AsyncOpenAI,
     model: str,
@@ -464,6 +538,7 @@ async def _call_with_validation(
     temperature: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
     max_retries: int = 2,
+    extra_validate: Optional[Callable[[_T], Optional[str]]] = None,
 ) -> _T:
     """Call the LLM and validate the response against *schema_cls*, with retries.
 
@@ -490,6 +565,13 @@ async def _call_with_validation(
     :param temperature: Optional sampling temperature. ``None`` omits it.
     :param reasoning_effort: Optional provider/model-supported reasoning effort.
     :param max_retries: Number of *additional* attempts after the first failure.
+    :param extra_validate: Optional callback run on the schema-validated model;
+        return a problem-description string to reject the response (retried
+        like any other validation failure), or None to accept it. Covers
+        semantic issues Pydantic can't catch — e.g. a local LLM corrupting
+        its own JSON mid-generation such that most of an array's intended
+        entries end up as literal text inside one earlier entry's string
+        field, which still passes ordinary schema validation.
     :raises LLMValidationError: When all attempts are exhausted.
     :return: Validated Pydantic model instance.
     """
@@ -497,6 +579,9 @@ async def _call_with_validation(
     last_error: Exception = RuntimeError("No attempts made")
 
     for attempt in range(max_retries + 1):
+        prompt_text = "\n".join(m.get("content", "") for m in current_messages)
+        logger.info("LLM PROMPT (attempt %d):\n%s", attempt + 1, prompt_text)
+
         response = None
         for response_format in _response_format_options(schema_cls):
             request_kwargs: Dict[str, Any] = {
@@ -527,6 +612,7 @@ async def _call_with_validation(
             raise RuntimeError("LLM request did not return a response")
 
         raw = response.choices[0].message.content.strip()
+        logger.info("LLM RESPONSE (attempt %d):\n%s", attempt + 1, raw)
         content = _extract_json_object(
             _repair_title_qualifiers(_strip_markdown_fences(raw))
         )
@@ -535,8 +621,12 @@ async def _call_with_validation(
             parsed = json.loads(content)
             parsed = _normalize_parsed_response(parsed, schema_cls)
             validated = schema_cls.model_validate(parsed)
+            if extra_validate is not None:
+                problem = extra_validate(validated)
+                if problem:
+                    raise _SemanticValidationError(problem)
             return validated
-        except (json.JSONDecodeError, ValidationError) as exc:
+        except (json.JSONDecodeError, ValidationError, _SemanticValidationError) as exc:
             last_error = exc
             preview = content.replace("\n", "\\n")[:200]
             logger.warning(
@@ -548,9 +638,14 @@ async def _call_with_validation(
                 preview,
             )
             if attempt < max_retries:
-                # Inject correction hint as the first system message and retry.
+                # A semantic-validation problem gets its own specific
+                # corrective message; schema/JSON failures get the generic hint.
+                retry_hint = (
+                    str(exc) if isinstance(exc, _SemanticValidationError)
+                    else _validation_retry_message(schema_cls)
+                )
                 current_messages = [
-                    {"role": "system", "content": _validation_retry_message(schema_cls)},
+                    {"role": "system", "content": retry_hint},
                     *messages,
                 ]
 
@@ -570,16 +665,23 @@ async def get_recommendations_from_history(
     max_results: int = 5,
     item_type: str = "movie",
     filters: Optional[Dict[str, Any]] = None,
+    candidates: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """Generate recommendations based on a user's watch history using an LLM.
+
+    When *candidates* is provided the LLM selects from that pre-validated pool
+    instead of generating titles freely, which eliminates hallucination.
 
     :param history_items: List of dicts with 'title' and ideally 'year'.
     :param max_results: Number of recommendations to generate.
     :param item_type: 'movie' or 'tv'.
     :param filters: Optional recommendation constraints (e.g. language/year/rating).
+    :param candidates: Optional list of pre-validated TMDb result dicts (same
+        format as returned by TMDbClient._format_result). When non-empty the LLM
+        is instructed to select from this pool rather than invent titles.
     :raises LLMValidationError: When the LLM persistently returns invalid JSON.
     :return: List of recommendation dicts with 'title', 'year', 'rationale',
-        and 'source_title'.
+        and 'source_title' (None when using candidate-selection mode).
     """
     client = get_llm_client()
     if not client:
@@ -627,14 +729,10 @@ async def get_recommendations_from_history(
         }
 
         list_type = "movies" if item_type == "movie" else "TV shows"
+        history_date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
         history_text = "\n".join(
-            _format_history_context_item(item, item_type) for item in history_items
-        )
-        web_context = await _get_web_search_context(
-            f"recent {list_type} similar to " + ", ".join(
-                str(item.get("title") or item.get("name") or "") for item in history_items[:5]
-            ),
-            config,
+            _fmt_item(item, i, history_date_field)
+            for i, item in enumerate(history_items, start=1)
         )
 
         constraint_lines: List[str] = []
@@ -679,7 +777,154 @@ async def get_recommendations_from_history(
         if constraint_lines:
             constraints_block = "\nApply these hard constraints:\n" + "\n".join(constraint_lines) + "\n"
 
-        prompt = f"""
+        if candidates:
+            # Scoring mode: LLM rates every candidate for taste fit; we select the top N.
+            # This eliminates hallucination (all candidates are real TMDb items) and lets
+            # the code — not the LLM — decide the final cut-off.
+            date_field = 'release_date' if item_type == 'movie' else 'first_air_date'
+
+            # `candidates` arrives pre-ranked by genre affinity with the user's
+            # watch history (then rating) — present it as a single ranked list
+            # rather than splitting back into "recommended"/"popular" blocks,
+            # which would re-impose a source-based ordering the pool-building
+            # step deliberately removed (a broadly-popular title that matches
+            # taste well should not be visually demoted below a weaker
+            # personalised one).
+            counter = 1
+            index_to_candidate: Dict[int, Dict] = {}
+            lines: List[str] = []
+            for c in candidates:
+                index_to_candidate[counter] = c
+                lines.append(_fmt_item(c, counter, date_field))
+                counter += 1
+            candidate_text = "CANDIDATES (ranked by fit with your watch history):\n" + "\n".join(lines)
+
+            prompt = f"""
+        You are an expert film and television recommendation system.
+        The user has recently watched the following {list_type}:
+
+        {history_text}
+        {constraints_block}
+        Analyse the themes, genres, pacing, and tone of their watch history to build a taste profile.
+        Then score EVERY candidate below from 0 to 100 based on how well it matches the user's taste.
+        We will select the top {max_results} highest-scored items automatically.
+
+        {candidate_text}
+
+        Rules:
+        1. Score EVERY candidate — do not skip any index.
+        2. Score 0–100: 100 = perfect fit, 0 = completely mismatched. Use the FULL range — most scores should fall between 20 and 80. Reserve 85+ for exceptional matches and below 30 for poor fits. Do NOT cluster scores in a narrow band.
+        3. The "reason" must be one short sentence explaining why THIS SPECIFIC item fits or does not fit the user's taste, grounded in its own genres/themes listed above (not a plot summary). Never reuse the wording of another item's reason or of the example below — each reason must be specific to that candidate.
+        4. Do NOT invent items. Only score items from the lists above.
+        5. ONLY respond with a valid JSON object — no markdown, no extra text.
+
+        Response format (the "reason" text below is illustrative only — replace it
+        with wording specific to each real candidate's own genres/themes, never copy it):
+        {{
+          "taste_profile": "One sentence summarising the user's taste.",
+          "scores": [
+            {{"index": 1, "score": 87, "reason": "<your own reason for THIS candidate>"}},
+            {{"index": 2, "score": 34, "reason": "<your own reason for THIS candidate>"}},
+            ...
+          ]
+        }}
+    """
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a specialized system that only outputs raw JSON objects for media scoring.",
+                },
+                {"role": "user", "content": prompt},
+            ]
+
+            logger.debug(
+                "Sending LLM scoring request (%s) for %d unique %s history items (%d candidates).",
+                model, len(history_items), list_type, len(candidates),
+            )
+
+            def _check_scoring_completeness(scored: CandidateScoringResponse) -> Optional[str]:
+                min_expected = len(candidates) * MIN_SCORE_COMPLETENESS_RATIO
+                if len(scored.scores) < min_expected:
+                    return (
+                        f"Your response only scored {len(scored.scores)} of the "
+                        f"{len(candidates)} candidates listed. Score EVERY candidate: "
+                        f"one JSON object per candidate in the \"scores\" array. Do not "
+                        f"embed additional candidates' scores as text inside another "
+                        f"candidate's \"reason\" string, and do not stop early."
+                    )
+                return None
+
+            try:
+                scored: CandidateScoringResponse = await _call_with_validation(
+                    client=client,
+                    model=model,
+                    messages=messages,
+                    schema_cls=CandidateScoringResponse,
+                    **generation_settings,
+                    max_retries=max_retries,
+                    extra_validate=_check_scoring_completeness,
+                )
+            except LLMValidationError as exc:
+                logger.error(
+                    "LLM scoring request failed after retries — falling back to standard algorithm. %s", exc,
+                )
+                return []
+
+            logger.info("LLM taste profile: %s", scored.taste_profile)
+
+            sorted_scores = sorted(scored.scores, key=lambda s: s.score, reverse=True)
+            valid_recommendations: List[Dict] = []
+            seen_indices: set = set()
+            for entry in sorted_scores:
+                if len(valid_recommendations) >= max_results:
+                    break
+                if entry.index in seen_indices:
+                    # The LLM occasionally emits the same index twice (seen in
+                    # production with two different scores for it) — keep only
+                    # the higher-scoring occurrence, since sorted_scores is
+                    # already sorted descending.
+                    logger.debug("LLM duplicated index %d — ignoring repeat.", entry.index)
+                    continue
+                seen_indices.add(entry.index)
+                candidate = index_to_candidate.get(entry.index)
+                if not candidate:
+                    logger.warning("LLM returned unknown index %d — skipping.", entry.index)
+                    continue
+                title = candidate.get('title') or candidate.get('name') or ''
+                if not title:
+                    continue
+                raw_date = candidate.get(date_field) or candidate.get('release_date') or candidate.get('first_air_date') or ''
+                year_str = raw_date[:4] if raw_date else ''
+                try:
+                    year = int(year_str)
+                except ValueError:
+                    year = 0
+                if _is_duplicate_of_history(title.strip().lower(), history_titles_lower):
+                    logger.debug("Filtered duplicate (scored): %s", title)
+                    continue
+                logger.info("[%s (%s)] score=%d%% — %s", title, year or '?', entry.score, entry.reason)
+                valid_recommendations.append({
+                    "title": title,
+                    "year": year,
+                    "rationale": entry.reason,
+                    "source_title": None,
+                    "score": entry.score,
+                })
+
+            logger.info("Selected %d top-scored %s recommendations.", len(valid_recommendations), list_type)
+            return valid_recommendations
+
+        else:
+            # Generation mode (fallback): LLM freely suggests titles.
+            # Used when no candidate pool could be built.
+            web_context = await _get_web_search_context(
+                f"recent {list_type} similar to " + ", ".join(
+                    str(item.get("title") or item.get("name") or "") for item in history_items[:5]
+                ),
+                config,
+            )
+            prompt = f"""
         You are an expert film and television recommendation system.
         The following {list_type} are watch-history context, ordered from most recent to least recent:
 
@@ -709,74 +954,67 @@ async def get_recommendations_from_history(
         }}
     """
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a specialized system that only outputs raw JSON objects for media recommendations.",
-            },
-            {"role": "user", "content": prompt},
-        ]
+            gen_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a specialized system that only outputs raw JSON objects for media recommendations.",
+                },
+                {"role": "user", "content": prompt},
+            ]
 
-        logger.debug(
-            "Sending LLM request (%s) for %d unique %s history items.",
-            model,
-            len(history_items),
-            list_type,
-        )
-
-        try:
-            validated: RecommendationList = await _call_with_validation(
-                client=client,
-                model=model,
-                messages=messages,
-                schema_cls=RecommendationList,
-                **generation_settings,
-                max_retries=max_retries,
-            )
-        except LLMValidationError as exc:
-            logger.error(
-                "LLM recommendation request failed after retries — falling back to standard algorithm. %s",
-                exc,
-            )
-            return []
-
-        valid_recommendations: List[Dict] = []
-        for rec in validated.recommendations:
-            rec_title = rec.title.strip().lower()
-
-            if _is_duplicate_of_history(rec_title, history_titles_lower):
-                logger.debug(
-                    "Filtered duplicate recommendation already in watch history: %s", rec.title
-                )
-                continue
-
-            source_title = rec.source_title
-            if source_title:
-                clean_source = _normalize_title(source_title)
-                if clean_source not in history_titles_lower:
-                    logger.warning(
-                        "LLM returned source_title '%s' not found in history. Clearing.",
-                        source_title,
-                    )
-                    source_title = None
-                else:
-                    stripped = re.sub(r'\s*[-–]\s*S\d+E\d+.*', '', source_title, flags=re.IGNORECASE)
-                    stripped = re.sub(r'\s*\((19|20)\d{2}\)\s*$', '', stripped)
-                    source_title = stripped.strip()
-
-            rec_dict: Dict[str, Any] = {
-                "title": rec.title,
-                "year": rec.year,
-                "rationale": rec.rationale or "No rationale provided by LLM.",
-                "source_title": source_title,
-            }
             logger.debug(
-                "[%s (%s)] LLM Rationale: %s", rec.title, rec.year, rec_dict["rationale"]
+                "Sending LLM generation request (%s) for %d unique %s history items.",
+                model, len(history_items), list_type,
             )
-            valid_recommendations.append(rec_dict)
 
-        logger.info("Successfully generated %d LLM recommendations.", len(valid_recommendations))
-        return valid_recommendations[:max_results]
+            try:
+                validated: RecommendationList = await _call_with_validation(
+                    client=client,
+                    model=model,
+                    messages=gen_messages,
+                    schema_cls=RecommendationList,
+                    **generation_settings,
+                    max_retries=max_retries,
+                )
+            except LLMValidationError as exc:
+                logger.error(
+                    "LLM recommendation request failed after retries — falling back to standard algorithm. %s",
+                    exc,
+                )
+                return []
+
+            valid_recommendations: List[Dict] = []
+            for rec in validated.recommendations:
+                rec_title = rec.title.strip().lower()
+
+                if _is_duplicate_of_history(rec_title, history_titles_lower):
+                    logger.debug("Filtered duplicate recommendation already in watch history: %s", rec.title)
+                    continue
+
+                source_title = rec.source_title
+                if source_title:
+                    clean_source = _normalize_title(source_title)
+                    if clean_source not in history_titles_lower:
+                        logger.warning(
+                            "LLM returned source_title '%s' not found in history. Clearing.", source_title,
+                        )
+                        source_title = None
+                    else:
+                        stripped = re.sub(r'\s*[-–]\s*S\d+E\d+.*', '', source_title, flags=re.IGNORECASE)
+                        stripped = re.sub(r'\s*\((19|20)\d{2}\)\s*$', '', stripped)
+                        source_title = stripped.strip()
+
+                logger.info("[%s (%s)] — %s", rec.title, rec.year, rec.rationale or "No rationale.")
+                valid_recommendations.append({
+                    "title": rec.title,
+                    "year": rec.year,
+                    "rationale": rec.rationale or "No rationale provided by LLM.",
+                    "source_title": source_title,
+                    "score": None,
+                })
+
+            logger.info("Successfully generated %d LLM recommendations.", len(valid_recommendations))
+            return valid_recommendations[:max_results]
     finally:
         await _close_llm_client(client)
 

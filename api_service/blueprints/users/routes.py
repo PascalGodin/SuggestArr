@@ -533,7 +533,10 @@ def list_provider_users(provider: str):
             f"{server_url}/Users",
             headers={
                 "X-Emby-Token": api_key,
-                "Authorization": f'MediaBrowser Token="{api_key}"'
+                "Authorization": (
+                    f'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
+                    f'DeviceId="suggestarr", Version="1.0.0", Token="{api_key}"'
+                ),
                 },
             timeout=10,
         )

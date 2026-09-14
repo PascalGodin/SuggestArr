@@ -121,30 +121,6 @@ class TestGetLibraries(unittest.IsolatedAsyncioTestCase):
             result = await self.client.get_libraries()
         self.assertIsNone(result)
 
-    async def get_libraries(self):
-        session = await self._get_session()
-        url = f"{self.api_url}/Library/VirtualFolders"
-    
-        # First attempt: legacy Jellyfin auth
-        headers = {
-            "X-Emby-Token": self.api_token
-        }
-    
-        response = await session.get(url, headers=headers)
-    
-        if response.status == 401:
-            # Retry with MediaBrowser Authorization header
-            headers = {
-                "Authorization": f'MediaBrowser Token="{self.api_token}"'
-            }
-            response = await session.get(url, headers=headers)
-    
-        if response.status != 200:
-            text = await response.text()
-            raise Exception(f"Failed to get libraries: {response.status} - {text}")
-    
-        return await response.json()
-
     async def test_retries_all_methods_and_succeeds_with_api_key_query_param(self):
         payload = [{'ItemId': 'lib2', 'Name': 'TV'}]
         responses = [
@@ -164,7 +140,7 @@ class TestGetLibraries(unittest.IsolatedAsyncioTestCase):
 
         third_call = session.get.call_args_list[2]
         self.assertIsNone(third_call.kwargs.get('headers'))
-        self.assertEqual(third_call.kwargs.get('params'), {'api_key': 'fake_token'})
+        self.assertEqual(third_call.kwargs.get('params'), {'ApiKey': 'fake_token'})
 
     async def test_returns_none_when_all_auth_methods_fail_after_401(self):
         # VirtualFolders and MediaFolders fallback each try 3 auth methods.
@@ -248,6 +224,47 @@ class TestGetAllLibraryItems(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result['movie']), 1)
         self.assertEqual(len(result['tv']), 0)
+
+    async def test_paginates_past_the_first_page(self):
+        """A full first page (== page_size) must trigger a second request; a
+        short page signals the end. Regression test for a Jellyfin 12 library
+        scan silently truncating at an implicit page cap."""
+        page_size = 500
+        first_page = {
+            'Items': [
+                {'Type': 'Movie', 'ProviderIds': {'Tmdb': str(i)}, 'Name': f'Movie {i}'}
+                for i in range(page_size)
+            ],
+            'TotalRecordCount': page_size + 1,
+        }
+        second_page = {
+            'Items': [
+                {'Type': 'Movie', 'ProviderIds': {'Tmdb': 'last'}, 'Name': 'Last Movie'},
+            ],
+            'TotalRecordCount': page_size + 1,
+        }
+        self.client.libraries = [{'id': 'lib1', 'name': 'Movies'}]
+
+        responses = iter([
+            _mock_response(200, first_page),
+            _mock_response(200, second_page),
+        ])
+        calls = []
+
+        def get_side_effect(*args, **kwargs):
+            calls.append(kwargs.get('params'))
+            return next(responses)
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=get_side_effect)
+        with patch.object(self.client, '_get_session', AsyncMock(return_value=session)):
+            result = await self.client.get_all_library_items()
+
+        self.assertEqual(len(result['movie']), page_size + 1)
+        self.assertEqual(result['movie'][-1]['tmdb_id'], 'last')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]['StartIndex'], 0)
+        self.assertEqual(calls[1]['StartIndex'], page_size)
 
     async def test_auto_fetches_libraries_when_not_configured(self):
         """When libraries=None the client should call get_libraries() first."""

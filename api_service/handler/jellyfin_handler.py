@@ -125,19 +125,32 @@ class JellyfinHandler(BaseMediaHandler):
                     except Exception:
                         pass
         if not tmdb_id:
+            self.logger.info(
+                "Seed skipped: '%s' has no TMDb provider ID in Jellyfin (only %s available) — "
+                "check the item's metadata provider in Jellyfin if this is unexpected.",
+                title, list((item.get('SeriesProviderIds') or item.get('ProviderIds') or {}).keys()) or 'none',
+            )
             return None
 
-        # Parse date.
+        # Parse date. Jellyfin reports the actual watch timestamp as
+        # UserData.LastPlayedDate, NOT a top-level 'DatePlayed' field — that
+        # field name never appears in a real /Users/{id}/Items response, so
+        # checking it alone silently fell through to DateCreated/PremiereDate
+        # for every item. That's invisible for newly-released shows (their
+        # air date roughly tracks "recent" anyway) but wrong for older shows
+        # watched recently (e.g. a 1999 anime just watched tonight sorting as
+        # if it were watched in 1999).
         date = 0
-        for field in ('DatePlayed', 'DateCreated', 'PremiereDate'):
-            val = item.get(field)
-            if val:
-                try:
-                    from datetime import datetime as dt
-                    date = int(dt.fromisoformat(str(val).replace('Z', '+00:00')).timestamp())
-                except (ValueError, TypeError):
-                    pass
+        user_data = item.get('UserData') or {}
+        for val in (user_data.get('LastPlayedDate'), item.get('DatePlayed'), item.get('DateCreated'), item.get('PremiereDate')):
+            if not val:
+                continue
+            try:
+                from datetime import datetime as dt
+                date = int(dt.fromisoformat(str(val).replace('Z', '+00:00')).timestamp())
                 break
+            except (ValueError, TypeError):
+                continue
 
         source_obj = None
         try:
@@ -323,7 +336,7 @@ class JellyfinHandler(BaseMediaHandler):
                     self.honor_seer_discovery
                     and str(media_id) in self.seer_discovered_ids
                 )
-                in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(source_tmdb_obj['id'], media_type)
+                in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(media_id, media_type)
 
                 # Merge streaming result into the filter_results dict from TMDb
                 filter_results = media.get('filter_results', {'passed': True})
@@ -402,23 +415,13 @@ class JellyfinHandler(BaseMediaHandler):
         tmdb_ids_to_check = [str(m.get('id')) for m in media_to_process if m.get('id')]
         already_requested_set = await self.seer_client.check_requests_exist_batch(media_type, tmdb_ids_to_check)
 
-        # 2. Get watch providers once
-        in_excluded_streaming_service = False
-        provider = None
-        if source_tmdb_obj.get('id') != 0:
-            in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(source_tmdb_obj['id'], media_type)
-        
-        if in_excluded_streaming_service:
-            self.logger.info(f"Skipping all similar {media_type} for source {source_tmdb_obj.get('id')}: source is on excluded service {provider}")
-            return
-
         tasks = []
         local_content_set = self.existing_content_sets.get(media_type, set())
 
         for media in media_to_process:
             if not isinstance(media, dict):
                 continue
-            
+
             media_id = str(media.get('id'))
             media_title = media.get('title') or media.get('name') or 'Unknown'
 
@@ -437,6 +440,16 @@ class JellyfinHandler(BaseMediaHandler):
                     "Skipping [%s, %s]: already discovered/requested in Seer.",
                     media_type,
                     media_title,
+                )
+                continue
+
+            # Get watch providers for this specific candidate (a no-op call when
+            # no region/excluded services are configured).
+            in_excluded_streaming_service, provider = await self.tmdb_client.get_watch_providers(media.get('id'), media_type)
+            if in_excluded_streaming_service:
+                self.logger.debug(
+                    "Skipping [%s, %s]: excluded by streaming service: %s",
+                    media_type, media_title, provider,
                 )
                 continue
 

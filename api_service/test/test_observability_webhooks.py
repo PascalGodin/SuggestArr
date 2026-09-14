@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import threading
 from unittest.mock import MagicMock, patch
 
 from flask import Flask, g
@@ -192,6 +193,7 @@ def test_job_completion_and_skip_events_are_queued():
     manager.logger = MagicMock()
     manager.repository = MagicMock()
     manager.repository.get_job.return_value = {'name': 'Test', 'job_type': 'discover'}
+    manager._job_semaphore = threading.Semaphore(1)
 
     async def executor(*_args, **_kwargs):
         return None

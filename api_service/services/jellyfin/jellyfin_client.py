@@ -34,8 +34,15 @@ class JellyfinClient(BaseHTTPClient):
         # Strip whitespace from token to avoid 401s from copy-paste artefacts.
         self.api_token = token.strip() if token else token
         self.headers = {
+            # X-Emby-Token is ignored by Jellyfin 12+ (EnableLegacyAuthorization defaults
+            # to false), so the standard Authorization header — with the full MediaBrowser
+            # field set, not just Token= — is the one that actually authenticates there.
+            # Kept for Emby and pre-12 Jellyfin, which still honor it.
             "X-Emby-Token": self.api_token,
-            "Authorization": f'MediaBrowser Token="{self.api_token}"'
+            "Authorization": (
+                f'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
+                f'DeviceId="suggestarr", Version="1.0.0", Token="{self.api_token}"'
+            ),
         }
         self.existing_content = {}
         self._series_provider_ids_cache = {}
@@ -109,45 +116,79 @@ class JellyfinClient(BaseHTTPClient):
             self.logger.error(f"Library item is missing 'id': {library}")
             return
 
-        params = {
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Series",
-            "Fields": "ProviderIds",
-            "ParentID": library_id
-        }
-
-        self.logger.debug(f"Requesting items for library {library_name} with params: {params}")
+        page_size = 500
+        start_index = 0
+        total_record_count = None
+        fetched = 0
+        added = 0
+        skipped_no_tmdb_id = 0
+        type_counts: dict = {}
 
         try:
-            async with session.get(
-                f"{self.api_url}/Items",
-                headers=self.headers,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=LIBRARY_FETCH_TIMEOUT)
-            ) as response:
-                if response.status != 200:
-                    self.logger.error("Failed to get items for library %s: %d", library_name, response.status)
-                    return
+            while True:
+                params = {
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Movie,Series",
+                    "Fields": "ProviderIds",
+                    "ParentID": library_id,
+                    "StartIndex": start_index,
+                    "Limit": page_size,
+                }
 
-                data = await response.json()
-                items = data.get("Items", [])
+                self.logger.debug(f"Requesting items for library {library_name} with params: {params}")
 
-                added = 0
-                for item in items:
-                    item_type = item.get("Type")
-                    if item_type not in ("Movie", "Series"):
-                        continue
+                async with session.get(
+                    f"{self.api_url}/Items",
+                    headers=self.headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=LIBRARY_FETCH_TIMEOUT)
+                ) as response:
+                    if response.status != 200:
+                        self.logger.error("Failed to get items for library %s: %d", library_name, response.status)
+                        return
 
-                    tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
-                    if not tmdb_id:
-                        continue
+                    data = await response.json()
+                    items = data.get("Items", [])
+                    total_record_count = data.get("TotalRecordCount", total_record_count)
+                    fetched += len(items)
 
-                    item["tmdb_id"] = tmdb_id
-                    bucket = "tv" if item_type == "Series" else "movie"
-                    results_by_library[bucket].append(item)
-                    added += 1
+                    for item in items:
+                        item_type = item.get("Type")
+                        if item_type not in ("Movie", "Series"):
+                            type_counts[item_type] = type_counts.get(item_type, 0) + 1
+                            # IncludeItemTypes=Movie,Series should already exclude this
+                            # server-side — if Jellyfin still hands back an oddly-typed
+                            # item that clearly has real movie/show metadata, surface it
+                            # instead of silently dropping it from existing-content.
+                            if item.get("ProviderIds", {}).get("Tmdb"):
+                                self.logger.warning(
+                                    "Library %s: '%s' has TMDb ID %s but Type=%r (expected Movie/Series) — excluded from existing content",
+                                    library_name, item.get("Name"), item["ProviderIds"]["Tmdb"], item_type,
+                                )
+                            continue
 
-                self.logger.info("Retrieved %d valid items in %s", added, library_name)
+                        tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
+                        if not tmdb_id:
+                            skipped_no_tmdb_id += 1
+                            continue
+
+                        item["tmdb_id"] = tmdb_id
+                        bucket = "tv" if item_type == "Series" else "movie"
+                        results_by_library[bucket].append(item)
+                        added += 1
+
+                # A short page (fewer items than requested) is the reliable signal
+                # that we've reached the end — don't gate on TotalRecordCount alone,
+                # since it's only used for logging and isn't guaranteed present.
+                if len(items) < page_size:
+                    break
+                start_index += page_size
+
+            self.logger.info(
+                "Retrieved %d valid items in %s (%d fetched, %d skipped for missing TMDb ID, "
+                "other types %s, server total %s)",
+                added, library_name, fetched, skipped_no_tmdb_id, type_counts or None, total_record_count,
+            )
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             self.logger.error("Error retrieving items for library %s: %s", library_name, str(e))
@@ -193,7 +234,7 @@ class JellyfinClient(BaseHTTPClient):
                 "IncludeItemTypes": "Movie,Episode",
                 "Limit": api_fetch_limit,
                 "ParentId": library_id,
-                "Fields": "ProviderIds,SeriesProviderIds",
+                "Fields": "ProviderIds,SeriesProviderIds,UserData",
             }
 
             self.logger.debug(
@@ -278,7 +319,7 @@ class JellyfinClient(BaseHTTPClient):
             "IncludeItemTypes": "Movie,Episode",
             "Limit": api_fetch_limit,
             "ParentId": library_id,
-            "Fields": "ProviderIds,SeriesProviderIds",
+            "Fields": "ProviderIds,SeriesProviderIds,UserData",
         }
 
         self.logger.debug(
@@ -371,22 +412,28 @@ class JellyfinClient(BaseHTTPClient):
 
         auth_attempts = [
             {
-                "name": "X-Emby-Token header",
+                # Jellyfin 12+ requires the full MediaBrowser field set on the standard
+                # Authorization header — Token= alone or the legacy X-Emby-Token header
+                # is silently ignored once EnableLegacyAuthorization defaults to false.
+                "name": "MediaBrowser Authorization header",
                 "headers": {
-                    "X-Emby-Token": self.api_token,
-                    "Authorization": f'MediaBrowser Token="{self.api_token}"'
+                    "Authorization": (
+                        f'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
+                        f'DeviceId="suggestarr", Version="1.0.0", Token="{self.api_token}"'
+                    )
                 },
                 "params": None,
             },
             {
-                "name": "MediaBrowser Authorization header",
-                "headers": {"Authorization": f'MediaBrowser Token="{self.api_token}"'},
+                "name": "X-Emby-Token header",
+                "headers": {"X-Emby-Token": self.api_token},
                 "params": None,
             },
             {
-                "name": "api_key query parameter",
+                # Jellyfin's query-param key is "ApiKey", not "api_key".
+                "name": "ApiKey query parameter",
                 "headers": None,
-                "params": {"api_key": self.api_token},
+                "params": {"ApiKey": self.api_token},
             },
         ]
 

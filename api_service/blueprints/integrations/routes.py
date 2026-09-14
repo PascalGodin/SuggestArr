@@ -34,7 +34,10 @@ def _jellyfin_auth_headers() -> dict[str, str]:
     return {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "X-Emby-Authorization": (
+        # X-Emby-Authorization is ignored by Jellyfin 12+ (EnableLegacyAuthorization
+        # defaults to false); the standard Authorization header with the same
+        # MediaBrowser field set is what actually gets parsed there.
+        "Authorization": (
             'MediaBrowser Client="SuggestArr", Device="SuggestArr", '
             'DeviceId="suggestarr", Version="1.0.0"'
         ),

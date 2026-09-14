@@ -48,6 +48,9 @@ class JobManager:
         self.repository = JobRepository()
         # Executors for different job types
         self._job_executors: Dict[str, Callable] = {}
+        # Semaphore ensures jobs run one at a time (critical for local LLM providers
+        # that cannot handle concurrent inference requests).
+        self._job_semaphore = threading.Semaphore(1)
         self._initialized = True
         self.logger.info("JobManager initialized")
 
@@ -156,15 +159,16 @@ class JobManager:
         else:
             self.logger.debug(f"Job not found in scheduler: {scheduler_job_id}")
 
-    def run_job_now(self, job_id: int) -> None:
+    def run_job_now(self, job_id: int, execution_id=None) -> None:
         """
         Execute a job immediately (not via scheduler).
 
         Args:
             job_id: Database ID of the job to run.
+            execution_id: Pre-created history id to record this run against, if any.
         """
         self.logger.info(f"Running job {job_id} immediately")
-        self._execute_job(job_id)
+        self._execute_job(job_id, execution_id)
 
     def enqueue_job_run(self, job_id: int, initiated_by_user_id=None, api_key_id=None) -> int:
         """Queue one public run and return its persistent history id immediately."""
@@ -181,10 +185,13 @@ class JobManager:
         Creates a new event loop for async execution.
         Determines job type and calls appropriate executor.
 
+        Jobs are queued via a semaphore so only one runs at a time, preventing
+        concurrent LLM inference requests on local providers.
+
         Args:
             job_id: Database ID of the job.
         """
-        # Get job data to determine type
+        # Validate before queuing so we fail fast without holding the slot.
         job_data = self.repository.get_job(job_id)
         if not job_data:
             self.logger.error(f"Job not found: {job_id}")
@@ -193,16 +200,17 @@ class JobManager:
         job_type = job_data.get('job_type', 'discover')
         started_at = time.monotonic()
         outcome = 'completed'
-        self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
 
-        # Get the executor for this job type
         executor = self._job_executors.get(job_type)
         if executor is None:
             self.logger.error(f"No executor set for job type: {job_type}")
             return
 
+        self.logger.info(f"Job {job_id} ({job_data['name']}) waiting for available slot...")
+        self._job_semaphore.acquire()
+
+        self.logger.info(f"Executing {job_type} job: {job_id} ({job_data['name']})")
         try:
-            # Create new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
@@ -247,10 +255,20 @@ class JobManager:
                     outcome = 'skipped'
                     return
                 if slices is None:
-                    loop.run_until_complete(executor(job_id, execution_id=execution_id) if execution_id is not None else executor(job_id))
+                    loop.run_until_complete(asyncio.wait_for(
+                        executor(job_id, execution_id=execution_id) if execution_id is not None else executor(job_id),
+                        timeout=3600,
+                    ))
                 else:
                     for overrides in slices:
-                        loop.run_until_complete(executor(job_id, overrides, execution_id=execution_id) if execution_id is not None else executor(job_id, overrides))
+                        loop.run_until_complete(asyncio.wait_for(
+                            executor(job_id, overrides, execution_id=execution_id) if execution_id is not None else executor(job_id, overrides),
+                            timeout=3600,
+                        ))
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Job {job_id} ({job_data['name']}) timed out after 1 hour of execution. Skipping."
+                )
             finally:
                 close_event_loop(loop, self.logger)
 
@@ -263,6 +281,7 @@ class JobManager:
                 self.repository.log_execution_end(execution_id, 'failed', error_message='Job execution failed')
             self._queue_webhook("run.failed", job_id, job_type, execution_id)
         finally:
+            self._job_semaphore.release()
             observe_job(job_type, outcome, time.monotonic() - started_at)
 
     def _queue_webhook(self, event, job_id, job_type, execution_id, reason=None):
