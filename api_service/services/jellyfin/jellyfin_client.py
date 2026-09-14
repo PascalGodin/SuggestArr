@@ -122,6 +122,7 @@ class JellyfinClient(BaseHTTPClient):
         fetched = 0
         added = 0
         skipped_no_tmdb_id = 0
+        type_counts: dict = {}
 
         try:
             while True:
@@ -154,6 +155,16 @@ class JellyfinClient(BaseHTTPClient):
                     for item in items:
                         item_type = item.get("Type")
                         if item_type not in ("Movie", "Series"):
+                            type_counts[item_type] = type_counts.get(item_type, 0) + 1
+                            # IncludeItemTypes=Movie,Series should already exclude this
+                            # server-side — if Jellyfin still hands back an oddly-typed
+                            # item that clearly has real movie/show metadata, surface it
+                            # instead of silently dropping it from existing-content.
+                            if item.get("ProviderIds", {}).get("Tmdb"):
+                                self.logger.warning(
+                                    "Library %s: '%s' has TMDb ID %s but Type=%r (expected Movie/Series) — excluded from existing content",
+                                    library_name, item.get("Name"), item["ProviderIds"]["Tmdb"], item_type,
+                                )
                             continue
 
                         tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
@@ -174,8 +185,9 @@ class JellyfinClient(BaseHTTPClient):
                 start_index += page_size
 
             self.logger.info(
-                "Retrieved %d valid items in %s (%d fetched, %d skipped for missing TMDb ID, server total %s)",
-                added, library_name, fetched, skipped_no_tmdb_id, total_record_count,
+                "Retrieved %d valid items in %s (%d fetched, %d skipped for missing TMDb ID, "
+                "other types %s, server total %s)",
+                added, library_name, fetched, skipped_no_tmdb_id, type_counts or None, total_record_count,
             )
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
